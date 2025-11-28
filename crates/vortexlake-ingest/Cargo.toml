@@ -1,0 +1,49 @@
+[package]
+name = "vortexlake-ingest"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Document ingestion pipelines and splitters for VortexLake"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+async-trait = "0.1"
+tracing.workspace = true
+
+# Text processing
+regex = "1.10"
+unicode-segmentation = "1.10"
+
+# Date/time and UUID
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# NLP and tokenization (for sentence splitting)
+rust_tokenizers = "8.1"
+
+# Local model inference (for proposition extraction)
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+tokenizers = "0.22.1"  # For text tokenization
+
+# Local dependencies
+vortexlake-core = { path = "../vortexlake-core" }
+
+text-splitter = "0.28.0"
+whatlang = "0.18.0"
+log = "0.4"
+
+# 可选：开启本地 Ollama 支持（推荐）
+ollama-rs = {version = "0.3.3", optional = true}
+
+[features]
+default = []
+ollama = ["dep:ollama-rs"]

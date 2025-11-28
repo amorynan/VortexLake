@@ -1,0 +1,6 @@
+[package]
+name = "debug_examples"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

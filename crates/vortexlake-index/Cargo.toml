@@ -1,0 +1,51 @@
+[package]
+name = "vortexlake-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Vector indexing layer that enhances columnar storage with similarity search capabilities"
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Arrow
+arrow.workspace = true
+arrow-array.workspace = true
+
+# Vector math
+ndarray.workspace = true
+
+# Async traits
+async-trait = "0.1"
+
+# Additional dependencies for vector operations
+rayon = "1.7"  # Parallel processing
+rand = "0.8"   # Random sampling
+num-traits = "0.2"  # Numeric operations
+
+# Logging
+tracing.workspace = true
+
+# Local crate dependencies
+vortexlake-core = { path = "../vortexlake-core" }
+
+[dev-dependencies]
+tempfile = "3.0"
+criterion = "0.5"
+
+# Benchmarks (uncomment when implementing)
+# [[bench]]
+# name = "index_benchmark"
+# harness = false
+
+# [[bench]]
+# name = "search_benchmark"
+# harness = false

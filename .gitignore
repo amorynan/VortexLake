@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test data (optional - comment out if you want to track test data)
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+
+# Debug
+*.dSYM/
+

@@ -1,0 +1,28 @@
+[package]
+name = "vortexlake-python"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Python bindings for VortexLake"
+
+[lib]
+name = "vortexlake"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+numpy = "0.20"
+tracing.workspace = true
+
+# Local dependencies
+vortexlake-core = { path = "../vortexlake-core" }
+vortexlake-index = { path = "../vortexlake-index" }
+vortexlake-sql = { path = "../vortexlake-sql" }
+vortexlake-ingest = { path = "../vortexlake-ingest" }

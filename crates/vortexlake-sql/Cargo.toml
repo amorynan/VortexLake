@@ -1,0 +1,68 @@
+[package]
+name = "vortexlake-sql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SQL analytics layer with vector search extensions using Apache DataFusion"
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# LanceDB for SQL interface and vector operations (removed for now)
+# lancedb = { version = "0.22.3", features = ["remote"] }
+
+# DataFusion ecosystem (for advanced queries)
+datafusion.workspace = true
+datafusion-common.workspace = true
+datafusion-expr.workspace = true
+datafusion-physical-expr.workspace = true
+datafusion-execution.workspace = true
+datafusion-sql.workspace = true
+
+# Arrow
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+
+# Additional dependencies
+async-trait = "0.1"
+futures = "0.3"
+datafusion-physical-plan = "50.3.0"
+datafusion-datasource = "50.3.0"
+
+# Vortex DataFusion integration
+vortex-datafusion = "0.56.0"
+vortex-session = "0.56.0"
+vortex = { version = "0.56.0", features = ["files", "tokio"] }
+
+# Object Store (must match DataFusion 51's version)
+object_store = "0.12"
+url = "2.5"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing.workspace = true
+
+# Local crate dependencies
+vortexlake-core = { path = "../vortexlake-core" }
+vortexlake-index = { path = "../vortexlake-index" }
+
+[dev-dependencies]
+tempfile = "3.0"
+tpchgen = "2.0.1"                 # TPC-H data generator core
+tpchgen-arrow = "2.0.1"           # TPC-H data generation in Arrow format
+criterion = { version = "0.5", features = ["async_tokio"] }
+prettytable-rs = "0.10"           # Table formatting for reports
+parquet = "56.2"                  # For Parquet comparison baseline
+
+[[bench]]
+name = "tpch_benchmark"
+harness = false

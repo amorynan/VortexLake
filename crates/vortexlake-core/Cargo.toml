@@ -1,0 +1,67 @@
+[package]
+name = "vortexlake-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "OLAP-optimized storage engine with Vortex columnar storage and vector column support"
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# DataFusion ecosystem
+datafusion.workspace = true
+datafusion-common.workspace = true
+datafusion-expr.workspace = true
+datafusion-physical-expr.workspace = true
+datafusion-execution.workspace = true
+
+# Vortex columnar storage
+vortex.workspace = true
+vortex-array.workspace = true
+vortex-dtype.workspace = true
+vortex-file.workspace = true
+vortex-io.workspace = true
+vortex-buffer.workspace = true
+vortex-error.workspace = true
+vortex-session = "0.56.0"
+
+# Arrow
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+arrow-buffer.workspace = true
+
+# Additional dependencies
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1.0"
+futures.workspace = true
+parking_lot = "0.12"
+uuid = { version = "1.0", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Compression
+zstd.workspace = true
+lz4.workspace = true
+
+# Logging
+tracing.workspace = true
+vortex-datafusion = "0.56.0"
+
+[dev-dependencies]
+tempfile = "3.0"
+criterion = "0.7.0"
+
+# Benchmarks (uncomment when implementing)
+# [[bench]]
+# name = "compression_benchmark"
+# harness = false

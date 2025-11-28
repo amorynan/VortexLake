@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vortexlake-core",
+    "crates/vortexlake-index",
+    "crates/vortexlake-sql",
+    "crates/vortexlake-ingest",
+    "crates/vortexlake-server",
+    "crates/vortexlake-python",
+    "debug_examples",
+]
+exclude = [
+    "examples",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/vortexlake"
+homepage = "https://github.com/yourusername/vortexlake"
+description = "Vector-enhanced columnar database built on Vortex OLAP storage with similarity search capabilities"
+
+[workspace.dependencies]
+# Core dependencies
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# DataFusion ecosystem (version 50.x to match vortex-datafusion 0.56)
+datafusion = "50.3.0"
+datafusion-common = "50.3.0"
+datafusion-expr = "50.3.0"
+datafusion-physical-expr = "50.3.0"
+datafusion-execution = "50.3.0"
+datafusion-sql = "50.3.0"
+
+# Vortex columnar storage
+vortex = { version = "0.56.0", features = ["files", "tokio", "serde"] }
+vortex-array = "0.56.0"
+vortex-dtype = "0.56.0"
+vortex-file = { version = "0.56.0", features = ["tokio"] }
+vortex-datafusion = "0.56.0"
+vortex-io = "0.56.0"
+vortex-buffer = "0.56.0"
+vortex-error = "0.56.0"
+
+# Arrow - use version 56 to match Vortex
+# DataFusion will bring its own arrow 57, we'll handle conversion at boundaries
+arrow = "56.2.0"
+arrow-array = "56.2.0"
+arrow-schema = "56.2.0"
+arrow-buffer = "56.2.0"
+arrow-cast = "56.2.0"
+arrow-ipc = "56.2.0"
+
+# Vector operations
+ndarray = "0.15"
+
+# Compression
+zstd = "0.13"
+lz4 = "1.24"
+
+# Async runtime
+futures = "0.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
