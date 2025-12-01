@@ -552,14 +552,99 @@ impl TableProvider for VortexLakeTableProvider {
             local_fs,
         );
 
-        // Get VortexSource from VortexFormat
-        let file_source = self.vortex_format.file_source();
+        // ============================================================
+        // NEW: 步骤 1 - 将逻辑表达式转换为物理表达式
+        // ============================================================
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion_common::DFSchema;
+        
+        let physical_filters: Vec<Arc<dyn PhysicalExpr>> = if !filters.is_empty() {
+            // 将 SchemaRef 转换为 DFSchema
+            let df_schema = DFSchema::try_from(self.schema.clone())
+                .map_err(|e| DataFusionError::Execution(format!("Failed to convert schema: {}", e)))?;
+            
+            let mut converted_filters = Vec::new();
+            for filter in filters {
+                match state.create_physical_expr(filter.clone(), &df_schema) {
+                    Ok(physical_expr) => {
+                        converted_filters.push(physical_expr);
+                        tracing::debug!("Converted filter to physical expression: {:?}", filter);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to convert filter to physical expression: {} - {:?}",
+                            e,
+                            filter
+                        );
+                        // 继续处理其他 filters
+                    }
+                }
+            }
+            
+            if !converted_filters.is_empty() {
+                tracing::info!(
+                    "Converted {}/{} filters to physical expressions",
+                    converted_filters.len(),
+                    filters.len()
+                );
+            }
+            
+            converted_filters
+        } else {
+            Vec::new()
+        };
 
+        // ============================================================
+        // NEW: 步骤 2 - 下推 filters 到 FileSource
+        // ============================================================
+        let file_source = self.vortex_format.file_source();
+        let config_options = state.config_options();
+        
+        let file_source_with_filters = if !physical_filters.is_empty() {
+            match file_source.try_pushdown_filters(physical_filters.clone(), config_options) {
+                Ok(pushdown_result) => {
+                    // 检查有多少 filters 被成功下推
+                    use datafusion_physical_plan::filter_pushdown::PushedDown;
+                    let pushed_count = pushdown_result
+                        .filters
+                        .iter()
+                        .filter(|result| matches!(result, PushedDown::Yes))
+                        .count();
+                    
+                    if pushed_count > 0 {
+                        tracing::info!(
+                            "Pushed down {}/{} filters to VortexFormat for Zone Map pruning",
+                            pushed_count,
+                            physical_filters.len()
+                        );
+                    } else {
+                        tracing::debug!("No filters were pushed down to VortexFormat (may not be supported yet)");
+                    }
+                    
+                    // 使用更新后的 FileSource（如果有），否则使用原来的
+                    pushdown_result.updated_node.unwrap_or_else(|| file_source.clone())
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to pushdown filters: {}", e);
+                    file_source.clone()
+                }
+            }
+        } else {
+            file_source.clone()
+        };
+
+        // ============================================================
+        // NEW: 步骤 3 - 使用新的 FileSource（如果 VortexFormat 支持）
+        // ============================================================
+        // 注意：如果 FileSource 有变化，我们需要使用新的 FileSource
+        // 但是 VortexFormat 可能没有直接的方法来更新 FileSource
+        // 目前先使用原来的 VortexFormat，filters 会在 FileSource 层面处理
+        
         // Build FileScanConfig using the builder
         let config_builder = FileScanConfigBuilder::new(
             object_store_url,
             self.schema.clone(),
-            file_source,
+            file_source_with_filters,
         )
         .with_file_groups(file_groups)
         .with_limit(limit);
@@ -576,7 +661,7 @@ impl TableProvider for VortexLakeTableProvider {
         // Layer 2: Delegate to VortexFormat for Zone Map pruning
         // VortexFormat::create_physical_plan handles:
         // - Opening Vortex files
-        // - Zone Map pruning within files
+        // - Zone Map pruning within files (now with pushed-down filters)
         // - Efficient columnar scanning
         self.vortex_format
             .create_physical_plan(state, file_scan_config)

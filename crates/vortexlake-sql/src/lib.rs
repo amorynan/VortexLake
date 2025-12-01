@@ -31,10 +31,12 @@
 
 pub mod execution;
 pub mod file_source;
+pub mod profiling;
 pub mod session;
 pub mod table_provider;
 
 pub use file_source::{PruningStats, VortexLakeFileList};
+pub use profiling::{execute_with_full_profile, compare_profiles, export_profile_json, QueryProfile};
 pub use session::{QueryResult, Session};
 pub use table_provider::VortexLakeTableProvider;
 

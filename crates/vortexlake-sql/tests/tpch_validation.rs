@@ -28,6 +28,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
+use datafusion_physical_plan::ExecutionPlan;
+use futures::TryStreamExt;
 use prettytable::{row, Table};
 use tempfile::TempDir;
 
@@ -415,6 +417,9 @@ async fn execute_query(ctx: &SessionContext, sql: &str) -> anyhow::Result<Vec<Re
     let results = df.collect().await?;
     Ok(results)
 }
+
+// Use the comprehensive profiling tool from vortexlake-sql
+use vortexlake_sql::profiling::{execute_with_full_profile, compare_profiles, QueryProfile};
 
 /// Compare two sets of RecordBatches for equality
 fn compare_results(
@@ -1681,5 +1686,75 @@ fn calculate_vortex_size(dir: &std::path::Path) -> anyhow::Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// Profile Q22 query to identify performance bottlenecks
+#[tokio::test]
+#[ignore] // Run with: cargo test -p vortexlake-sql profile_q22 -- --nocapture --ignored
+async fn profile_q22() -> anyhow::Result<()> {
+    use std::path::Path;
+    
+    println!("\n{}", "=".repeat(80));
+    println!("Q22 Performance Profiling");
+    println!("{}", "=".repeat(80));
+    
+    // Check if test data exists
+    let base_dir = Path::new(TEST_DATA_DIR);
+    let parquet_dir = base_dir.join("tpch_parquet");
+    let vortex_dir = base_dir.join("tpch_vortexlake");
+    
+    if !parquet_dir.exists() || !vortex_dir.exists() {
+        println!("Test data not found. Please run complete_tpch_benchmark first.");
+        return Ok(());
+    }
+    
+    // Setup sessions
+    let table_names = vec!["customer", "orders"];
+    let parquet_ctx = setup_parquet_session_all(&parquet_dir, &table_names).await?;
+    let vortex_ctx = setup_vortexlake_session_all(&vortex_dir, &table_names).await?;
+    
+    println!("\n--- Parquet Profile ---");
+    let (parquet_results, parquet_profile) = execute_with_full_profile(&parquet_ctx, TPCH_Q22).await?;
+    parquet_profile.print();
+    println!("\nParquet result rows: {}", parquet_results.iter().map(|b| b.num_rows()).sum::<usize>());
+    
+    println!("\n--- VortexLake Profile ---");
+    let (vortex_results, vortex_profile) = execute_with_full_profile(&vortex_ctx, TPCH_Q22).await?;
+    vortex_profile.print();
+    println!("\nVortexLake result rows: {}", vortex_results.iter().map(|b| b.num_rows()).sum::<usize>());
+    
+    // Compare profiles using the comprehensive comparison tool
+    compare_profiles(&parquet_profile, "Parquet", &vortex_profile, "VortexLake");
+    
+    // Print EXPLAIN plans
+    println!("\n--- Parquet EXPLAIN ---");
+    let parquet_explain = parquet_ctx.sql(&format!("EXPLAIN {}", TPCH_Q22)).await?;
+    let parquet_explain_results = parquet_explain.collect().await?;
+    for batch in &parquet_explain_results {
+        for row in 0..batch.num_rows() {
+            for col in 0..batch.num_columns() {
+                let array = batch.column(col);
+                if let Some(string_array) = array.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    println!("{}", string_array.value(row));
+                }
+            }
+        }
+    }
+    
+    println!("\n--- VortexLake EXPLAIN ---");
+    let vortex_explain = vortex_ctx.sql(&format!("EXPLAIN {}", TPCH_Q22)).await?;
+    let vortex_explain_results = vortex_explain.collect().await?;
+    for batch in &vortex_explain_results {
+        for row in 0..batch.num_rows() {
+            for col in 0..batch.num_columns() {
+                let array = batch.column(col);
+                if let Some(string_array) = array.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    println!("{}", string_array.value(row));
+                }
+            }
+        }
+    }
+    
+    Ok(())
 }
 
