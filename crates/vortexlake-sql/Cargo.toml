@@ -62,6 +62,7 @@ tpchgen-arrow = "2.0.1"           # TPC-H data generation in Arrow format
 criterion = { version = "0.5", features = ["async_tokio"] }
 prettytable-rs = "0.10"           # Table formatting for reports
 parquet = "56.2"                  # For Parquet comparison baseline
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # Logging configuration
 
 [[bench]]
 name = "tpch_benchmark"

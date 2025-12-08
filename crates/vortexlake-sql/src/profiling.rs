@@ -59,14 +59,49 @@ pub struct OperatorMetrics {
     /// Total output rows
     pub output_rows: Option<usize>,
     
-    /// Input rows (if available)
+    /// Input rows (if available) - used to calculate filter selectivity
     pub input_rows: Option<usize>,
+    
+    /// Rows filtered out (for FilterExec: input_rows - output_rows)
+    pub rows_filtered: Option<usize>,
+    
+    /// Filter selectivity ratio (output_rows / input_rows)
+    pub selectivity: Option<f64>,
     
     /// Spilled bytes to disk
     pub spilled_bytes: Option<usize>,
     
     /// Spilled rows to disk
     pub spilled_rows: Option<usize>,
+    
+    // === I/O and Scan Metrics (from Parquet/Vortex) ===
+    
+    /// Bytes scanned from storage
+    pub bytes_scanned: Option<usize>,
+    
+    /// Rows pruned by pushdown predicates
+    pub pushdown_rows_pruned: Option<usize>,
+    
+    /// Rows matched by pushdown predicates
+    pub pushdown_rows_matched: Option<usize>,
+    
+    /// Row groups pruned by statistics
+    pub row_groups_pruned_statistics: Option<usize>,
+    
+    /// Row groups matched by statistics
+    pub row_groups_matched_statistics: Option<usize>,
+    
+    /// Time spent evaluating row-level pushdown filters
+    pub row_pushdown_eval_time: Option<Duration>,
+    
+    /// Time spent loading metadata
+    pub metadata_load_time: Option<Duration>,
+    
+    /// Page index rows pruned
+    pub page_index_rows_pruned: Option<usize>,
+    
+    /// All other metrics (name -> value as string)
+    pub other_metrics: Vec<(String, String)>,
     
     /// Start timestamp
     pub start_time: Option<chrono::DateTime<chrono::Utc>>,
@@ -92,6 +127,10 @@ pub struct ProfileSummary {
     pub max_depth: usize,
     pub slowest_operator: Option<String>,
     pub largest_operator: Option<String>,
+    
+    // Filter statistics
+    pub total_rows_filtered: usize,
+    pub filter_selectivity: Option<f64>,
 }
 
 impl QueryProfile {
@@ -146,6 +185,7 @@ impl QueryProfile {
         
         // Extract metrics from this node (available after execution)
         if let Some(metrics) = plan.metrics() {
+            // Standard metrics
             node_metrics.output_rows = metrics.output_rows();
             node_metrics.spilled_bytes = metrics.spilled_bytes();
             node_metrics.spilled_rows = metrics.spilled_rows();
@@ -154,6 +194,9 @@ impl QueryProfile {
             if let Some(nanos) = metrics.elapsed_compute() {
                 node_metrics.elapsed_compute = Some(Duration::from_nanos(nanos as u64));
             }
+            
+            // Extract all other metrics from the MetricsSet
+            Self::extract_all_metrics(&metrics, &mut node_metrics);
         }
         
         // Build children recursively
@@ -162,6 +205,22 @@ impl QueryProfile {
             .iter()
             .map(|child| Self::build_node(child, depth + 1))
             .collect();
+        
+        // Calculate filter statistics for FilterExec
+        // Input rows = find the first valid output_rows in the subtree
+        // (RepartitionExec and some other operators don't expose output_rows)
+        if operator_name.contains("Filter") && !children.is_empty() {
+            let input_rows = Self::find_input_rows_in_subtree(&children);
+            
+            if input_rows > 0 {
+                node_metrics.input_rows = Some(input_rows);
+                
+                if let Some(output) = node_metrics.output_rows {
+                    node_metrics.rows_filtered = Some(input_rows.saturating_sub(output));
+                    node_metrics.selectivity = Some(output as f64 / input_rows as f64);
+                }
+            }
+        }
         
         PlanNode {
             operator_type,
@@ -172,11 +231,114 @@ impl QueryProfile {
         }
     }
     
+    /// Extract all available metrics from MetricsSet
+    fn extract_all_metrics(metrics: &MetricsSet, node_metrics: &mut OperatorMetrics) {
+        use datafusion_physical_plan::metrics::MetricValue;
+        
+        // Track scan time components for aggregation
+        let mut scan_total_nanos: u64 = 0;
+        
+        for metric in metrics.iter() {
+            let name = metric.value().name();
+            match metric.value() {
+                MetricValue::Count { name, count } => {
+                    let value = count.value();
+                    match name.as_ref() {
+                        "bytes_scanned" => {
+                            // Accumulate bytes_scanned from all partitions
+                            let current = node_metrics.bytes_scanned.unwrap_or(0);
+                            node_metrics.bytes_scanned = Some(current + value);
+                        }
+                        "pushdown_rows_pruned" => {
+                            let current = node_metrics.pushdown_rows_pruned.unwrap_or(0);
+                            node_metrics.pushdown_rows_pruned = Some(current + value);
+                        }
+                        "pushdown_rows_matched" => {
+                            let current = node_metrics.pushdown_rows_matched.unwrap_or(0);
+                            node_metrics.pushdown_rows_matched = Some(current + value);
+                        }
+                        "row_groups_pruned_statistics" => {
+                            let current = node_metrics.row_groups_pruned_statistics.unwrap_or(0);
+                            node_metrics.row_groups_pruned_statistics = Some(current + value);
+                        }
+                        "row_groups_matched_statistics" => {
+                            let current = node_metrics.row_groups_matched_statistics.unwrap_or(0);
+                            node_metrics.row_groups_matched_statistics = Some(current + value);
+                        }
+                        "page_index_rows_pruned" => {
+                            let current = node_metrics.page_index_rows_pruned.unwrap_or(0);
+                            node_metrics.page_index_rows_pruned = Some(current + value);
+                        }
+                        _ => {
+                            // Skip other count metrics to reduce noise
+                        }
+                    }
+                }
+                MetricValue::Time { name, time } => {
+                    let nanos = time.value();
+                    let duration = Duration::from_nanos(nanos as u64);
+                    match name.as_ref() {
+                        "row_pushdown_eval_time" => node_metrics.row_pushdown_eval_time = Some(duration),
+                        "metadata_load_time" => {
+                            // Accumulate metadata_load_time
+                            let current = node_metrics.metadata_load_time.unwrap_or(Duration::ZERO);
+                            node_metrics.metadata_load_time = Some(current + duration);
+                        }
+                        "time_elapsed_scanning_total" => {
+                            // Accumulate scan time from all partitions (use max instead of sum for parallel)
+                            scan_total_nanos = scan_total_nanos.max(nanos as u64);
+                        }
+                        _ => {
+                            // Skip other time metrics to reduce noise
+                        }
+                    }
+                }
+                MetricValue::Gauge { .. } => {
+                    // Skip gauge metrics
+                }
+                MetricValue::StartTimestamp { .. } | MetricValue::EndTimestamp { .. } => {
+                    // Skip timestamps
+                }
+                _ => {
+                    // Skip other types
+                }
+            }
+        }
+        
+        // Store aggregated scan time
+        if scan_total_nanos > 0 {
+            node_metrics.other_metrics.push((
+                "scan_time".to_string(),
+                format!("{:.2}ms", scan_total_nanos as f64 / 1_000_000.0)
+            ));
+        }
+    }
+    
+    /// Recursively find the first valid output_rows in the subtree
+    /// This is needed because operators like RepartitionExec don't expose output_rows
+    fn find_input_rows_in_subtree(children: &[PlanNode]) -> usize {
+        for child in children {
+            // First check if this child has output_rows
+            if let Some(rows) = child.metrics.output_rows {
+                return rows;
+            }
+            // If not, recursively check its children
+            let nested_rows = Self::find_input_rows_in_subtree(&child.children);
+            if nested_rows > 0 {
+                return nested_rows;
+            }
+        }
+        0
+    }
+    
     fn analyze_bottlenecks(&mut self) {
         let mut slowest_time = Duration::ZERO;
         let mut slowest_name = None;
         let mut largest_rows = 0;
         let mut largest_name = None;
+        let mut total_filtered = 0usize;
+        let mut total_input_rows = 0usize;
+        let mut total_output_rows = 0usize;
         
         self.plan_tree.visit(&mut |node| {
             if let Some(time) = node.metrics.elapsed_compute {
@@ -191,11 +353,29 @@ impl QueryProfile {
                     largest_name = Some(node.operator_name.clone());
                 }
             }
+            
+            // Collect filter statistics
+            if node.operator_name.contains("Filter") {
+                if let Some(filtered) = node.metrics.rows_filtered {
+                    total_filtered += filtered;
+                }
+                if let Some(input) = node.metrics.input_rows {
+                    total_input_rows += input;
+                }
+                if let Some(output) = node.metrics.output_rows {
+                    total_output_rows += output;
+                }
+            }
         });
         
         self.summary.slowest_operator = slowest_name;
         self.summary.largest_operator = largest_name;
         self.summary.total_rows_processed = largest_rows;
+        self.summary.total_rows_filtered = total_filtered;
+        
+        if total_input_rows > 0 {
+            self.summary.filter_selectivity = Some(total_output_rows as f64 / total_input_rows as f64);
+        }
     }
     
     /// Print detailed profile report
@@ -253,8 +433,18 @@ impl QueryProfile {
         println!("Total Operators:           {}", self.summary.operator_count);
         println!("Plan Depth:                {}", self.summary.max_depth);
         println!("Total Rows Processed:      {}", self.summary.total_rows_processed);
+        
+        // Filter statistics
+        if self.summary.total_rows_filtered > 0 {
+            println!("\n--- Filter Statistics (Layer 3: DataFusion Filter) ---");
+            println!("Rows Filtered:             {}", self.summary.total_rows_filtered);
+            if let Some(selectivity) = self.summary.filter_selectivity {
+                println!("Filter Selectivity:        {:.2}% pass rate", selectivity * 100.0);
+            }
+        }
+        
         if let Some(ref slowest) = self.summary.slowest_operator {
-            println!("Slowest Operator:          {}", slowest);
+            println!("\nSlowest Operator:          {}", slowest);
         }
         if let Some(ref largest) = self.summary.largest_operator {
             println!("Largest Operator (rows):   {}", largest);
@@ -305,12 +495,59 @@ impl PlanNode {
         
         // Build metrics string
         let mut metrics_parts = Vec::new();
-        if let Some(rows) = self.metrics.output_rows {
-            metrics_parts.push(format!("rows:{}", rows));
+        
+        // For Filter operators, show filter statistics
+        if self.operator_name.contains("Filter") {
+            if let (Some(input), Some(output)) = (self.metrics.input_rows, self.metrics.output_rows) {
+                let filtered = input.saturating_sub(output);
+                let selectivity = if input > 0 { 
+                    (output as f64 / input as f64) * 100.0 
+                } else { 
+                    100.0 
+                };
+                metrics_parts.push(format!("in:{} -> out:{} (filtered:{}, {:.1}% pass)", 
+                    input, output, filtered, selectivity));
+            } else if let Some(rows) = self.metrics.output_rows {
+                metrics_parts.push(format!("rows:{}", rows));
+            }
+        } else {
+            if let Some(rows) = self.metrics.output_rows {
+                metrics_parts.push(format!("rows:{}", rows));
+            }
         }
+        
+        // I/O metrics for DataSourceExec (Parquet/Vortex scan)
+        if self.operator_name.contains("DataSource") || self.operator_name.contains("Scan") {
+            // Show scan time (most important I/O metric)
+            for (name, value) in &self.metrics.other_metrics {
+                if name == "scan_time" {
+                    metrics_parts.push(format!("scan:{}", value));
+                }
+            }
+            if let Some(bytes) = self.metrics.bytes_scanned {
+                if bytes > 0 {
+                    metrics_parts.push(format!("read:{}", Self::format_bytes(bytes)));
+                }
+            }
+            if let Some(pruned) = self.metrics.pushdown_rows_pruned {
+                if pruned > 0 {
+                    let matched = self.metrics.pushdown_rows_matched.unwrap_or(0);
+                    let total = pruned + matched;
+                    let pct = if total > 0 { (pruned as f64 / total as f64) * 100.0 } else { 0.0 };
+                    metrics_parts.push(format!("pruned:{} ({:.1}%)", pruned, pct));
+                }
+            }
+            if let Some(rg_pruned) = self.metrics.row_groups_pruned_statistics {
+                if rg_pruned > 0 {
+                    let rg_matched = self.metrics.row_groups_matched_statistics.unwrap_or(0);
+                    metrics_parts.push(format!("rg_pruned:{}/{}", rg_pruned, rg_pruned + rg_matched));
+                }
+            }
+        }
+        
         if let Some(bytes) = self.metrics.spilled_bytes {
             if bytes > 0 {
-                metrics_parts.push(format!("spilled:{}B", bytes));
+                metrics_parts.push(format!("spilled:{}", Self::format_bytes(bytes)));
             }
         }
         if let Some(time) = self.metrics.elapsed_compute {
@@ -332,18 +569,78 @@ impl PlanNode {
         }
     }
     
+    /// Format bytes in human readable format
+    fn format_bytes(bytes: usize) -> String {
+        if bytes >= 1024 * 1024 * 1024 {
+            format!("{:.2}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else if bytes >= 1024 * 1024 {
+            format!("{:.2}MB", bytes as f64 / (1024.0 * 1024.0))
+        } else if bytes >= 1024 {
+            format!("{:.2}KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{}B", bytes)
+        }
+    }
+    
     fn write_tree<W: std::io::Write>(&self, writer: &mut W, prefix: &str, is_last: bool) -> std::io::Result<()> {
         let connector = if is_last { "└── " } else { "├── " };
         let next_prefix = if is_last { "    " } else { "│   " };
         
         // Build metrics string
         let mut metrics_parts = Vec::new();
-        if let Some(rows) = self.metrics.output_rows {
-            metrics_parts.push(format!("rows:{}", rows));
+        
+        // For Filter operators, show filter statistics
+        if self.operator_name.contains("Filter") {
+            if let (Some(input), Some(output)) = (self.metrics.input_rows, self.metrics.output_rows) {
+                let filtered = input.saturating_sub(output);
+                let selectivity = if input > 0 { 
+                    (output as f64 / input as f64) * 100.0 
+                } else { 
+                    100.0 
+                };
+                metrics_parts.push(format!("in:{} -> out:{} (filtered:{}, {:.1}% pass)", 
+                    input, output, filtered, selectivity));
+            } else if let Some(rows) = self.metrics.output_rows {
+                metrics_parts.push(format!("rows:{}", rows));
+            }
+        } else {
+            if let Some(rows) = self.metrics.output_rows {
+                metrics_parts.push(format!("rows:{}", rows));
+            }
         }
+        
+        // I/O metrics for DataSourceExec (Parquet/Vortex scan)
+        if self.operator_name.contains("DataSource") || self.operator_name.contains("Scan") {
+            // Show scan time (most important I/O metric)
+            for (name, value) in &self.metrics.other_metrics {
+                if name == "scan_time" {
+                    metrics_parts.push(format!("scan:{}", value));
+                }
+            }
+            if let Some(bytes) = self.metrics.bytes_scanned {
+                if bytes > 0 {
+                    metrics_parts.push(format!("read:{}", Self::format_bytes(bytes)));
+                }
+            }
+            if let Some(pruned) = self.metrics.pushdown_rows_pruned {
+                if pruned > 0 {
+                    let matched = self.metrics.pushdown_rows_matched.unwrap_or(0);
+                    let total = pruned + matched;
+                    let pct = if total > 0 { (pruned as f64 / total as f64) * 100.0 } else { 0.0 };
+                    metrics_parts.push(format!("pruned:{} ({:.1}%)", pruned, pct));
+                }
+            }
+            if let Some(rg_pruned) = self.metrics.row_groups_pruned_statistics {
+                if rg_pruned > 0 {
+                    let rg_matched = self.metrics.row_groups_matched_statistics.unwrap_or(0);
+                    metrics_parts.push(format!("rg_pruned:{}/{}", rg_pruned, rg_pruned + rg_matched));
+                }
+            }
+        }
+        
         if let Some(bytes) = self.metrics.spilled_bytes {
             if bytes > 0 {
-                metrics_parts.push(format!("spilled:{}B", bytes));
+                metrics_parts.push(format!("spilled:{}", Self::format_bytes(bytes)));
             }
         }
         if let Some(time) = self.metrics.elapsed_compute {

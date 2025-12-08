@@ -49,11 +49,47 @@ use tpchgen_arrow::{
 use vortexlake_core::{VortexLake, Schema as VLSchema, Field as VLField};
 use vortexlake_sql::table_provider::VortexLakeTableProvider;
 
+/// Initialize tracing subscriber for test logging
+/// 
+/// Log level can be controlled via RUST_LOG environment variable:
+/// - RUST_LOG=vortexlake_sql=info (default for tests)
+/// - RUST_LOG=vortexlake_sql=debug (more verbose)
+/// - RUST_LOG=info (all crates at info level)
+fn init_test_logging() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    
+    INIT.call_once(|| {
+        // Use RUST_LOG if set, otherwise default to info level for vortexlake_sql
+        let default_filter = std::env::var("RUST_LOG")
+            .unwrap_or_else(|_| "vortexlake_sql=info".to_string());
+        
+        tracing_subscriber::fmt()
+            .with_env_filter(default_filter)
+            .with_test_writer()
+            .init();
+    });
+}
+
 /// TPC-H Scale Factor for tests (0.01 = ~6MB data, 0.1 = ~60MB, 1.0 = ~600MB)
 const SCALE_FACTOR: f64 = 0.1;
 
 /// Test data directory (persistent, not deleted after tests)
-const TEST_DATA_DIR: &str = "/mnt/disk2/wangqiannan/cks/votexlake";
+/// Uses absolute path to avoid URL encoding issues with ObjectPath
+fn get_test_data_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target/test_data")
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            // If canonicalize fails (dir doesn't exist), create and return the path
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("target/test_data");
+            std::fs::create_dir_all(&path).ok();
+            path.canonicalize().unwrap_or(path)
+        })
+}
 
 // ============================================================================
 // Official TPC-H Data Generation
@@ -1088,8 +1124,8 @@ async fn full_validation_suite() -> anyhow::Result<()> {
     }
 
     // Use fixed test data directory
-    let base_dir = Path::new(TEST_DATA_DIR);
-    tokio::fs::create_dir_all(base_dir).await?;
+    let base_dir = get_test_data_dir();
+    tokio::fs::create_dir_all(&base_dir).await?;
     let parquet_path = base_dir.join("tpch_lineitem.parquet");
     let vortexlake_path = base_dir.join("tpch_vortexlake_db");
     
@@ -1248,8 +1284,8 @@ async fn test_vortexlake_e2e() -> anyhow::Result<()> {
     let batch = generate_lineitem_data(100);
     
     // Use fixed test data directory
-    let base_dir = Path::new(TEST_DATA_DIR);
-    tokio::fs::create_dir_all(base_dir).await?;
+    let base_dir = get_test_data_dir();
+    tokio::fs::create_dir_all(&base_dir).await?;
     let db_path = base_dir.join("e2e_test_db");
     
     // Clean up previous test data if exists
@@ -1514,6 +1550,9 @@ async fn setup_vortexlake_session_all(db_path: &std::path::Path, tables: &[&str]
 async fn complete_tpch_benchmark() -> anyhow::Result<()> {
     use std::path::Path;
     
+    // Initialize logging (respects RUST_LOG env var, defaults to vortexlake_sql=info)
+    init_test_logging();
+    
     println!("\n{}", "=".repeat(80));
     println!("Complete TPC-H Benchmark (All Tables, All Queries)");
     println!("Scale Factor: {}", SCALE_FACTOR);
@@ -1523,8 +1562,8 @@ async fn complete_tpch_benchmark() -> anyhow::Result<()> {
     let tables = generate_all_tpch_tables(SCALE_FACTOR);
     
     // Setup directories
-    let base_dir = Path::new(TEST_DATA_DIR);
-    tokio::fs::create_dir_all(base_dir).await?;
+    let base_dir = get_test_data_dir();
+    tokio::fs::create_dir_all(&base_dir).await?;
     let parquet_dir = base_dir.join("tpch_parquet");
     let vortex_dir = base_dir.join("tpch_vortexlake");
     
@@ -1572,7 +1611,7 @@ async fn complete_tpch_benchmark() -> anyhow::Result<()> {
         ("Q1", TPCH_Q1),     // LINEITEM only - pricing summary
         ("Q6", TPCH_Q6),     // LINEITEM only - revenue forecast
         
-        // 2-table queries
+        // 2-table queries``
         ("Q12", TPCH_Q12),   // ORDERS + LINEITEM
         ("Q14", TPCH_Q14),   // LINEITEM + PART
         ("Q19", TPCH_Q19),   // LINEITEM + PART (complex OR)
@@ -1631,7 +1670,10 @@ async fn complete_tpch_benchmark() -> anyhow::Result<()> {
                     let rows: usize = results.iter().map(|b| b.num_rows()).sum();
                     Some((ms, rows))
                 }
-                Err(_) => None
+                Err(e) => {
+                    eprintln!("  [{}] VortexLake error: {:?}", name, e);
+                    None
+                }
             }
         };
         
@@ -1697,9 +1739,11 @@ async fn profile_q22() -> anyhow::Result<()> {
     println!("\n{}", "=".repeat(80));
     println!("Q22 Performance Profiling");
     println!("{}", "=".repeat(80));
+
+    init_test_logging();
     
     // Check if test data exists
-    let base_dir = Path::new(TEST_DATA_DIR);
+    let base_dir = get_test_data_dir();
     let parquet_dir = base_dir.join("tpch_parquet");
     let vortex_dir = base_dir.join("tpch_vortexlake");
     
@@ -1713,47 +1757,73 @@ async fn profile_q22() -> anyhow::Result<()> {
     let parquet_ctx = setup_parquet_session_all(&parquet_dir, &table_names).await?;
     let vortex_ctx = setup_vortexlake_session_all(&vortex_dir, &table_names).await?;
     
+    // Setup VortexLake session with forced CollectLeft join (for A/B test)
+    // Create a new session with high threshold to force CollectLeft
+    use datafusion::prelude::SessionConfig;
+    let forced_config = SessionConfig::new()
+        .set_usize("datafusion.optimizer.hash_join_single_partition_threshold", 1024 * 1024 * 1024)
+        .set_usize("datafusion.optimizer.hash_join_single_partition_threshold_rows", 1024 * 1024 * 1024);
+    let vortex_ctx_forced = SessionContext::new_with_config(forced_config);
+    // Register tables
+    for table_name in &table_names {
+        let provider = VortexLakeTableProvider::new(
+            vortex_dir.to_str().unwrap(),
+            table_name,
+        ).await?;
+        vortex_ctx_forced.register_table(*table_name, Arc::new(provider))?;
+    }
+    
     println!("\n--- Parquet Profile ---");
     let (parquet_results, parquet_profile) = execute_with_full_profile(&parquet_ctx, TPCH_Q22).await?;
     parquet_profile.print();
     println!("\nParquet result rows: {}", parquet_results.iter().map(|b| b.num_rows()).sum::<usize>());
     
-    println!("\n--- VortexLake Profile ---");
+    println!("\n--- VortexLake Profile (default) ---");
     let (vortex_results, vortex_profile) = execute_with_full_profile(&vortex_ctx, TPCH_Q22).await?;
     vortex_profile.print();
     println!("\nVortexLake result rows: {}", vortex_results.iter().map(|b| b.num_rows()).sum::<usize>());
     
+    println!("\n--- VortexLake Profile (forced CollectLeft) ---");
+    let (vortex_forced_results, vortex_forced_profile) = execute_with_full_profile(&vortex_ctx_forced, TPCH_Q22).await?;
+    vortex_forced_profile.print();
+    println!("\nVortexLake (forced) result rows: {}", vortex_forced_results.iter().map(|b| b.num_rows()).sum::<usize>());
+    
     // Compare profiles using the comprehensive comparison tool
+    println!("\n\n--- Comparison: Parquet vs VortexLake (default) ---");
     compare_profiles(&parquet_profile, "Parquet", &vortex_profile, "VortexLake");
     
-    // Print EXPLAIN plans
-    println!("\n--- Parquet EXPLAIN ---");
-    let parquet_explain = parquet_ctx.sql(&format!("EXPLAIN {}", TPCH_Q22)).await?;
-    let parquet_explain_results = parquet_explain.collect().await?;
-    for batch in &parquet_explain_results {
-        for row in 0..batch.num_rows() {
+    println!("\n\n--- Comparison: VortexLake (default) vs VortexLake (forced CollectLeft) ---");
+    compare_profiles(&vortex_profile, "Vortex-Default", &vortex_forced_profile, "Vortex-Forced");
+    
+    // Print HashJoin mode from EXPLAIN
+    println!("\n--- HashJoin Modes (from EXPLAIN) ---");
+    
+    async fn print_join_mode(ctx: &SessionContext, name: &str, sql: &str) -> anyhow::Result<()> {
+        let explain = ctx.sql(&format!("EXPLAIN {}", sql)).await?.collect().await?;
+        for batch in &explain {
             for col in 0..batch.num_columns() {
                 let array = batch.column(col);
                 if let Some(string_array) = array.as_any().downcast_ref::<arrow::array::StringArray>() {
-                    println!("{}", string_array.value(row));
+                    for row in 0..batch.num_rows() {
+                        let val = string_array.value(row);
+                        if val.contains("HashJoinExec") {
+                            for line in val.lines() {
+                                if line.contains("HashJoinExec") {
+                                    println!("{}: {}", name, line.trim());
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+        Ok(())
     }
     
-    println!("\n--- VortexLake EXPLAIN ---");
-    let vortex_explain = vortex_ctx.sql(&format!("EXPLAIN {}", TPCH_Q22)).await?;
-    let vortex_explain_results = vortex_explain.collect().await?;
-    for batch in &vortex_explain_results {
-        for row in 0..batch.num_rows() {
-            for col in 0..batch.num_columns() {
-                let array = batch.column(col);
-                if let Some(string_array) = array.as_any().downcast_ref::<arrow::array::StringArray>() {
-                    println!("{}", string_array.value(row));
-                }
-            }
-        }
-    }
+    print_join_mode(&parquet_ctx, "Parquet", TPCH_Q22).await?;
+    print_join_mode(&vortex_ctx, "VortexLake (default)", TPCH_Q22).await?;
+    print_join_mode(&vortex_ctx_forced, "VortexLake (forced)", TPCH_Q22).await?;
     
     Ok(())
 }

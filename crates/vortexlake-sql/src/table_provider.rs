@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::datasource::TableProvider;
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::DataFusionError;
 use datafusion_datasource::file_groups::FileGroup;
@@ -304,8 +304,16 @@ impl VortexLakeTableProvider {
 
     /// Check if a fragment can be pruned based on filter expressions
     fn can_prune_fragment(&self, fragment: &FragmentMetadata, filters: &[Expr]) -> bool {
-        for filter in filters {
-            if self.filter_can_prune(fragment, filter) {
+        for (i, filter) in filters.iter().enumerate() {
+            let can_prune = self.filter_can_prune(fragment, filter);
+            tracing::debug!(
+                "  Fragment '{}' Filter {}: {:?} -> {}",
+                fragment.id,
+                i + 1,
+                filter,
+                if can_prune { "CAN PRUNE (skip)" } else { "CANNOT PRUNE (keep)" }
+            );
+            if can_prune {
                 return true;
             }
         }
@@ -318,12 +326,50 @@ impl VortexLakeTableProvider {
             Expr::BinaryExpr(binary) => {
                 // Try to extract column, operator, and literal value
                 if let Some((column, op, value)) = Self::extract_comparison(&binary.left, &binary.op, &binary.right) {
-                    return fragment.can_prune(&column, &op, &value);
+                    let can_prune = fragment.can_prune(&column, &op, &value);
+                    // Log detailed pruning decision
+                    if let Some(stats) = fragment.column_stats.get(&column) {
+                        tracing::debug!(
+                            "    Column '{}': min={:?}, max={:?} | Filter: {} {} {:?} -> {}",
+                            column,
+                            stats.min_value,
+                            stats.max_value,
+                            column,
+                            op,
+                            value,
+                            if can_prune { "PRUNE" } else { "KEEP" }
+                        );
+                    } else {
+                        tracing::debug!(
+                            "    Column '{}': NO STATS available -> KEEP (conservative)",
+                            column
+                        );
+                    }
+                    return can_prune;
                 }
                 // Also try reversed order (e.g., 5 < x)
                 if let Some((column, op, value)) = Self::extract_comparison_reversed(&binary.left, &binary.op, &binary.right) {
-                    return fragment.can_prune(&column, &op, &value);
+                    let can_prune = fragment.can_prune(&column, &op, &value);
+                    if let Some(stats) = fragment.column_stats.get(&column) {
+                        tracing::debug!(
+                            "    Column '{}': min={:?}, max={:?} | Filter: {} {} {:?} -> {}",
+                            column,
+                            stats.min_value,
+                            stats.max_value,
+                            column,
+                            op,
+                            value,
+                            if can_prune { "PRUNE" } else { "KEEP" }
+                        );
+                    } else {
+                        tracing::debug!(
+                            "    Column '{}': NO STATS available -> KEEP (conservative)",
+                            column
+                        );
+                    }
+                    return can_prune;
                 }
+                tracing::debug!("    BinaryExpr not a simple comparison -> KEEP (conservative)");
                 false
             }
             Expr::Not(_inner) => {
@@ -367,6 +413,7 @@ impl VortexLakeTableProvider {
             _ => return None,
         };
 
+        // TODO: why here use expr_to_json? why not use right directly?
         let value = Self::expr_to_json(right)?;
 
         let op_str = match op {
@@ -504,6 +551,76 @@ impl TableProvider for VortexLakeTableProvider {
         TableType::Base
     }
 
+    /// Indicate which filters can be pushed down to the TableProvider.
+    /// 
+    /// This enables DataFusion's filter pushdown optimization, which moves
+    /// filter predicates from the Filter operator into the TableScan.
+    /// 
+    /// We return `Inexact` for supported filters because:
+    /// 1. Manifest-level pruning may skip entire fragments
+    /// 2. Zone-map pruning within Vortex files may skip row groups
+    /// 3. But we don't guarantee all non-matching rows are filtered
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
+        use datafusion::logical_expr::Operator;
+        
+        filters
+            .iter()
+            .map(|expr| {
+                match expr {
+                    // Support basic comparison operators
+                    Expr::BinaryExpr(binary) => {
+                        match binary.op {
+                            // Equality and inequality
+                            Operator::Eq | Operator::NotEq |
+                            // Range comparisons
+                            Operator::Lt | Operator::LtEq |
+                            Operator::Gt | Operator::GtEq => {
+                                // Check if one side is a column reference
+                                let has_column = matches!(binary.left.as_ref(), Expr::Column(_))
+                                    || matches!(binary.right.as_ref(), Expr::Column(_));
+                                if has_column {
+                                    Ok(TableProviderFilterPushDown::Inexact)
+                                } else {
+                                    Ok(TableProviderFilterPushDown::Unsupported)
+                                }
+                            }
+                            // AND/OR can be partially supported
+                            Operator::And | Operator::Or => {
+                                Ok(TableProviderFilterPushDown::Inexact)
+                            }
+                            _ => Ok(TableProviderFilterPushDown::Unsupported)
+                        }
+                    }
+                    // Support IS NULL / IS NOT NULL
+                    Expr::IsNull(_) | Expr::IsNotNull(_) => {
+                        Ok(TableProviderFilterPushDown::Inexact)
+                    }
+                    // Support BETWEEN
+                    Expr::Between(_) => {
+                        Ok(TableProviderFilterPushDown::Inexact)
+                    }
+                    // Support IN list
+                    Expr::InList(_) => {
+                        Ok(TableProviderFilterPushDown::Inexact)
+                    }
+                    // Support NOT expressions
+                    Expr::Not(_) => {
+                        Ok(TableProviderFilterPushDown::Inexact)
+                    }
+                    // Support LIKE patterns (useful for string filtering)
+                    Expr::Like(_) | Expr::SimilarTo(_) => {
+                        Ok(TableProviderFilterPushDown::Inexact)
+                    }
+                    // Unsupported: complex expressions, subqueries, etc.
+                    _ => Ok(TableProviderFilterPushDown::Unsupported)
+                }
+            })
+            .collect()
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -511,6 +628,25 @@ impl TableProvider for VortexLakeTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        // ============================================================
+        // Filter Pushdown Visibility - Log received filters
+        // ============================================================
+        if filters.is_empty() {
+            tracing::info!(
+                "[{}] Filter Pushdown: NO filters received (check supports_filters_pushdown implementation)",
+                self.table_name
+            );
+        } else {
+            tracing::info!(
+                "[{}] Filter Pushdown SUCCESS: Received {} filter(s) from DataFusion optimizer:",
+                self.table_name,
+                filters.len()
+            );
+            for (i, filter) in filters.iter().enumerate() {
+                tracing::info!("  [{}] Filter {}: {:?}", self.table_name, i + 1, filter);
+            }
+        }
+
         // Get all fragments from manifest using public API
         let all_fragments = self.db
             .get_fragments(&self.table_name)
@@ -521,12 +657,25 @@ impl TableProvider for VortexLakeTableProvider {
         let (pruned_fragments, pruning_stats) = self.prune_fragments_by_manifest(&all_fragments, filters);
 
         tracing::info!(
-            "Manifest pruning for table '{}': {} -> {} fragments ({:.1}% pruned)",
+            "[{}] Manifest Pruning (Layer 1): {} -> {} fragments ({:.1}% pruned, {} rows skipped)",
             self.table_name,
             pruning_stats.total_fragments,
             pruning_stats.remaining_fragments,
-            pruning_stats.pruning_ratio() * 100.0
+            pruning_stats.pruning_ratio() * 100.0,
+            pruning_stats.total_rows - pruning_stats.remaining_rows
         );
+        
+        // Explain if no pruning occurred
+        if pruning_stats.pruned_fragments == 0 && !filters.is_empty() {
+            tracing::info!(
+                "[{}] Note: 0% pruned because filter ranges overlap with all fragment min/max stats.",
+                self.table_name
+            );
+            tracing::info!(
+                "[{}] Row filtering will happen at Layer 2 (Zone Map) and Layer 3 (DataFusion Filter).",
+                self.table_name
+            );
+        }
 
         if pruned_fragments.is_empty() {
             // Return empty result
