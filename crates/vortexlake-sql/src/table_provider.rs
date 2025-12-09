@@ -63,6 +63,8 @@ pub struct VortexLakeTableProvider {
     vortex_session: VortexSession,
     /// Vortex format for DataFusion integration
     vortex_format: Arc<VortexFormat>,
+    /// Cached table statistics for query optimization
+    cached_statistics: Option<datafusion_common::Statistics>,
 }
 
 impl Debug for VortexLakeTableProvider {
@@ -95,6 +97,19 @@ impl VortexLakeTableProvider {
             opts,
         ));
 
+        // Pre-compute and cache table statistics for query optimization
+        let cached_statistics = Self::compute_statistics(&db, table_name, &schema).await.ok();
+        
+        // Log statistics for debugging
+        if let Some(ref stats) = cached_statistics {
+            tracing::info!(
+                "[{}] Statistics: num_rows={:?}, total_bytes={:?}",
+                table_name,
+                stats.num_rows,
+                stats.total_byte_size
+            );
+        }
+
         Ok(Self {
             db,
             table_name: table_name.to_string(),
@@ -102,7 +117,171 @@ impl VortexLakeTableProvider {
             base_path,
             vortex_session,
             vortex_format,
+            cached_statistics,
         })
+    }
+
+    /// Compute table statistics from manifest fragments
+    /// 
+    /// This aggregates statistics from all fragments to provide accurate
+    /// row counts and column statistics for query optimization.
+    async fn compute_statistics(
+        db: &VortexLake,
+        table_name: &str,
+        schema: &SchemaRef,
+    ) -> Result<datafusion_common::Statistics> {
+        use datafusion_common::stats::Precision;
+        use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
+        
+        // Get all fragments
+        let fragments = db.get_fragments(table_name).await?;
+        
+        if fragments.is_empty() {
+            return Ok(Statistics {
+                num_rows: Precision::Exact(0),
+                total_byte_size: Precision::Exact(0),
+                column_statistics: schema.fields().iter().map(|_| ColumnStatistics::new_unknown()).collect(),
+            });
+        }
+        
+        // Aggregate row count and byte size
+        let total_rows: usize = fragments.iter().map(|f| f.row_count).sum();
+        let total_bytes: usize = fragments.iter().map(|f| f.size_bytes as usize).sum();
+        
+        // Aggregate column statistics
+        let column_statistics: Vec<ColumnStatistics> = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let col_name = field.name();
+                
+                // Aggregate null counts across all fragments
+                let total_null_count: usize = fragments
+                    .iter()
+                    .filter_map(|f| f.column_stats.get(col_name))
+                    .map(|s| s.null_count)
+                    .sum();
+                
+                // Find global min/max across all fragments
+                let (min_value, max_value) = Self::aggregate_min_max(&fragments, col_name, field.data_type());
+                
+                ColumnStatistics {
+                    null_count: Precision::Exact(total_null_count),
+                    min_value,
+                    max_value,
+                    sum_value: Precision::Absent, // Not tracked
+                    distinct_count: Precision::Absent, // TODO: Could aggregate if available
+                }
+            })
+            .collect();
+        
+        Ok(Statistics {
+            num_rows: Precision::Exact(total_rows),
+            total_byte_size: Precision::Exact(total_bytes),
+            column_statistics,
+        })
+    }
+    
+    /// Aggregate min/max values across all fragments for a column
+    fn aggregate_min_max(
+        fragments: &[FragmentMetadata],
+        col_name: &str,
+        data_type: &datafusion::arrow::datatypes::DataType,
+    ) -> (datafusion_common::stats::Precision<datafusion_common::ScalarValue>, 
+          datafusion_common::stats::Precision<datafusion_common::ScalarValue>) {
+        use datafusion_common::stats::Precision;
+        use datafusion_common::ScalarValue;
+        
+        let mut global_min: Option<serde_json::Value> = None;
+        let mut global_max: Option<serde_json::Value> = None;
+        
+        for fragment in fragments {
+            if let Some(stats) = fragment.column_stats.get(col_name) {
+                // Update global min
+                if let Some(ref frag_min) = stats.min_value {
+                    match &global_min {
+                        None => global_min = Some(frag_min.clone()),
+                        Some(current) => {
+                            if Self::compare_json_values(frag_min, current) < 0 {
+                                global_min = Some(frag_min.clone());
+                            }
+                        }
+                    }
+                }
+                
+                // Update global max
+                if let Some(ref frag_max) = stats.max_value {
+                    match &global_max {
+                        None => global_max = Some(frag_max.clone()),
+                        Some(current) => {
+                            if Self::compare_json_values(frag_max, current) > 0 {
+                                global_max = Some(frag_max.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Convert JSON values to ScalarValue based on data type
+        let min_scalar = global_min
+            .and_then(|v| Self::json_to_scalar(&v, data_type))
+            .map(Precision::Exact)
+            .unwrap_or(Precision::Absent);
+        
+        let max_scalar = global_max
+            .and_then(|v| Self::json_to_scalar(&v, data_type))
+            .map(Precision::Exact)
+            .unwrap_or(Precision::Absent);
+        
+        (min_scalar, max_scalar)
+    }
+    
+    /// Compare two JSON values for ordering
+    fn compare_json_values(a: &serde_json::Value, b: &serde_json::Value) -> i32 {
+        match (a, b) {
+            (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
+                let a_f64 = a.as_f64().unwrap_or(0.0);
+                let b_f64 = b.as_f64().unwrap_or(0.0);
+                if a_f64 < b_f64 { -1 } else if a_f64 > b_f64 { 1 } else { 0 }
+            }
+            (serde_json::Value::String(a), serde_json::Value::String(b)) => {
+                a.cmp(b) as i32
+            }
+            _ => 0
+        }
+    }
+    
+    /// Convert JSON value to DataFusion ScalarValue
+    fn json_to_scalar(
+        value: &serde_json::Value,
+        data_type: &datafusion::arrow::datatypes::DataType,
+    ) -> Option<datafusion_common::ScalarValue> {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion_common::ScalarValue;
+        
+        match data_type {
+            DataType::Int8 => value.as_i64().map(|v| ScalarValue::Int8(Some(v as i8))),
+            DataType::Int16 => value.as_i64().map(|v| ScalarValue::Int16(Some(v as i16))),
+            DataType::Int32 => value.as_i64().map(|v| ScalarValue::Int32(Some(v as i32))),
+            DataType::Int64 => value.as_i64().map(|v| ScalarValue::Int64(Some(v))),
+            DataType::UInt8 => value.as_u64().map(|v| ScalarValue::UInt8(Some(v as u8))),
+            DataType::UInt16 => value.as_u64().map(|v| ScalarValue::UInt16(Some(v as u16))),
+            DataType::UInt32 => value.as_u64().map(|v| ScalarValue::UInt32(Some(v as u32))),
+            DataType::UInt64 => value.as_u64().map(|v| ScalarValue::UInt64(Some(v))),
+            DataType::Float32 => value.as_f64().map(|v| ScalarValue::Float32(Some(v as f32))),
+            DataType::Float64 => value.as_f64().map(|v| ScalarValue::Float64(Some(v))),
+            DataType::Utf8 => value.as_str().map(|v| ScalarValue::Utf8(Some(v.to_string()))),
+            DataType::LargeUtf8 => value.as_str().map(|v| ScalarValue::LargeUtf8(Some(v.to_string()))),
+            DataType::Decimal128(precision, scale) => {
+                value.as_f64().map(|v| {
+                    let scaled = (v * 10f64.powi(*scale as i32)) as i128;
+                    ScalarValue::Decimal128(Some(scaled), *precision, *scale)
+                })
+            }
+            // For other types, return None (Absent)
+            _ => None,
+        }
     }
 
     /// Convert schema from arrow 56 to arrow 57 via IPC serialization
@@ -551,6 +730,16 @@ impl TableProvider for VortexLakeTableProvider {
         TableType::Base
     }
 
+    /// Return table statistics for query optimization
+    /// 
+    /// This enables DataFusion's optimizer to:
+    /// - Choose optimal join strategies (CollectLeft vs Partitioned)
+    /// - Estimate query cardinality
+    /// - Make better predicate pushdown decisions
+    fn statistics(&self) -> Option<datafusion_common::Statistics> {
+        self.cached_statistics.clone()
+    }
+
     /// Indicate which filters can be pushed down to the TableProvider.
     /// 
     /// This enables DataFusion's filter pushdown optimization, which moves
@@ -790,13 +979,17 @@ impl TableProvider for VortexLakeTableProvider {
         // 目前先使用原来的 VortexFormat，filters 会在 FileSource 层面处理
         
         // Build FileScanConfig using the builder
+        // IMPORTANT: Pass statistics to enable optimal join strategy selection (CollectLeft vs Partitioned)
         let config_builder = FileScanConfigBuilder::new(
             object_store_url,
             self.schema.clone(),
             file_source_with_filters,
         )
         .with_file_groups(file_groups)
-        .with_limit(limit);
+        .with_limit(limit)
+        .with_statistics(self.cached_statistics.clone().unwrap_or_else(|| {
+            datafusion_common::Statistics::new_unknown(&self.schema)
+        }));
 
         // Apply projection if specified
         let config_builder = if let Some(proj) = projection {

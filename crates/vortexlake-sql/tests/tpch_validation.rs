@@ -1502,7 +1502,7 @@ async fn write_all_to_vortexlake(tables: &[TpchTableInfo], db_path: &std::path::
         
         db.create_table(table.name, vl_schema).await?;
         
-        let mut writer = db.writer(table.name)?;
+        let mut writer = db.writer(table.name)? .with_max_buffer_size(100_000);
         for batch in &table.batches {
             writer.write_batch(batch.clone()).await?;
         }
@@ -1548,8 +1548,6 @@ async fn setup_vortexlake_session_all(db_path: &std::path::Path, tables: &[&str]
 #[tokio::test]
 #[ignore] // Run with: cargo test -p vortexlake-sql complete_tpch_benchmark -- --nocapture --ignored
 async fn complete_tpch_benchmark() -> anyhow::Result<()> {
-    use std::path::Path;
-    
     // Initialize logging (respects RUST_LOG env var, defaults to vortexlake_sql=info)
     init_test_logging();
     
@@ -1734,13 +1732,12 @@ fn calculate_vortex_size(dir: &std::path::Path) -> anyhow::Result<u64> {
 #[tokio::test]
 #[ignore] // Run with: cargo test -p vortexlake-sql profile_q22 -- --nocapture --ignored
 async fn profile_q22() -> anyhow::Result<()> {
-    use std::path::Path;
     
     println!("\n{}", "=".repeat(80));
     println!("Q22 Performance Profiling");
     println!("{}", "=".repeat(80));
 
-    init_test_logging();
+    // init_test_logging();
     
     // Check if test data exists
     let base_dir = get_test_data_dir();

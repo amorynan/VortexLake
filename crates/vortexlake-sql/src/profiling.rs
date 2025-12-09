@@ -30,6 +30,9 @@ pub struct QueryProfile {
     
     /// Summary statistics
     pub summary: ProfileSummary,
+    
+    /// Raw DataFusion physical plan string (native format with full operator details)
+    pub raw_physical_plan: String,
 }
 
 /// Metrics for a single execution phase
@@ -140,7 +143,13 @@ impl QueryProfile {
             phases: Vec::new(),
             plan_tree: PlanNode::new("Root", "Root"),
             summary: ProfileSummary::default(),
+            raw_physical_plan: String::new(),
         }
+    }
+    
+    /// Set the raw DataFusion physical plan string
+    pub fn set_raw_physical_plan(&mut self, plan: impl Into<String>) {
+        self.raw_physical_plan = plan.into();
     }
     
     pub fn set_origin_sql(&mut self, sql: impl Into<String>) {
@@ -382,8 +391,16 @@ impl QueryProfile {
     pub fn print(&self) {
         println!("Origin SQL:\n {}", self.origin_sql);
         self.print_phases();
+        self.print_raw_physical_plan();
         self.print_plan_tree();
         self.print_summary();
+    }
+    
+    fn print_raw_physical_plan(&self) {
+        println!("\n{}", "=".repeat(80));
+        println!("DataFusion Physical Plan (Native Format)");
+        println!("{}", "=".repeat(80));
+        println!("{}", self.raw_physical_plan);
     }
     
     fn print_phases(&self) {
@@ -690,6 +707,11 @@ pub async fn execute_with_full_profile(
     let physical_plan = ctx.state().create_physical_plan(&optimized_plan).await?;
     let phys_time = phys_start.elapsed();
     profile.add_phase("3. Create Physical Plan", phys_time);
+    
+    // Capture raw physical plan string (DataFusion native format with full operator details)
+    use datafusion_physical_plan::displayable;
+    let raw_plan = displayable(physical_plan.as_ref()).indent(true).to_string();
+    profile.set_raw_physical_plan(raw_plan);
     
     // Phase 4: Execution (with detailed metrics collection)
     let exec_start = Instant::now();
