@@ -6,11 +6,7 @@ members = [
     "crates/vortexlake-sql",
     "crates/vortexlake-ingest",
     "crates/vortexlake-server",
-    "crates/vortexlake-python",
-    "debug_examples",
-]
-exclude = [
-    "examples",
+    "crates/vortexlake-python"
 ]
 
 [workspace.package]
