@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use uuid::Uuid;
 use vortex::VortexSessionDefault;
+use vortex::compute::min_max;
 use vortex_array::arrow::FromArrowArray;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_array::ArrayRef;
@@ -173,7 +174,10 @@ impl Fragment {
 
     /// Compute column statistics for query optimization
     fn compute_column_stats(batch: &RecordBatch) -> Result<HashMap<String, ColumnStats>> {
-        use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array};
+        use arrow::array::{
+            Array, Decimal128Array, Decimal256Array, Decimal32Array, Decimal64Array, Float32Array,
+            Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        };
         use arrow::datatypes::DataType;
 
         let mut stats = HashMap::new();
@@ -190,7 +194,7 @@ impl Fragment {
                         let min = arrow::compute::min(arr);
                         let max = arrow::compute::max(arr);
                         let is_constant = min.is_some() && min == max && arr.len() > 0;
-                        let is_sorted = Self::check_sorted_i32(arr);
+                        let is_sorted = Self::check_sorted(arr);
                         (
                             min.map(|v| serde_json::json!(v)),
                             max.map(|v| serde_json::json!(v)),
@@ -207,7 +211,7 @@ impl Fragment {
                         let min = arrow::compute::min(arr);
                         let max = arrow::compute::max(arr);
                         let is_constant = min.is_some() && min == max && arr.len() > 0;
-                        let is_sorted = Self::check_sorted_i64(arr);
+                        let is_sorted = Self::check_sorted(arr);
                         (
                             min.map(|v| serde_json::json!(v)),
                             max.map(|v| serde_json::json!(v)),
@@ -224,7 +228,7 @@ impl Fragment {
                         let min = arrow::compute::min(arr);
                         let max = arrow::compute::max(arr);
                         let is_constant = min.is_some() && min == max && arr.len() > 0;
-                        let is_sorted = Self::check_sorted_f32(arr);
+                        let is_sorted = Self::check_sorted(arr);
                         (
                             min.map(|v| serde_json::json!(v)),
                             max.map(|v| serde_json::json!(v)),
@@ -241,10 +245,112 @@ impl Fragment {
                         let min = arrow::compute::min(arr);
                         let max = arrow::compute::max(arr);
                         let is_constant = min.is_some() && min == max && arr.len() > 0;
-                        let is_sorted = Self::check_sorted_f64(arr);
+                        let is_sorted = Self::check_sorted(arr);
                         (
                             min.map(|v| serde_json::json!(v)),
                             max.map(|v| serde_json::json!(v)),
+                            is_sorted,
+                            is_constant,
+                        )
+                    } else {
+                        (None, None, false, false)
+                    }
+                }
+                DataType::Utf8 => {
+                    let arr = array.as_any().downcast_ref::<StringArray>();
+                    if let Some(arr) = arr {
+                        let min = arr.iter().flatten().min();
+                        let max = arr.iter().flatten().max();
+                        let is_constant = min.is_some() && min == max && arr.len() > 0;
+                        let is_sorted = Self::check_sorted_utf8_generic(arr);
+                        (
+                            min.map(|v| serde_json::json!(v)),
+                            max.map(|v| serde_json::json!(v)),
+                            is_sorted,
+                            is_constant,
+                        )
+                    } else {
+                        (None, None, false, false)
+                    }
+                }
+                DataType::LargeUtf8 => {
+                    let arr = array.as_any().downcast_ref::<LargeStringArray>();
+                    if let Some(arr) = arr {
+                        let min = arr.iter().flatten().min();
+                        let max = arr.iter().flatten().max();
+                        let is_constant = min.is_some() && min == max && arr.len() > 0;
+                        let is_sorted = Self::check_sorted_utf8_generic(arr);
+                        (
+                            min.map(|v| serde_json::json!(v)),
+                            max.map(|v| serde_json::json!(v)),
+                            is_sorted,
+                            is_constant,
+                        )
+                    } else {
+                        (None, None, false, false)
+                    }
+                }
+                DataType::Decimal32(_precision, _scale) => {
+                    let arr = array.as_any().downcast_ref::<Decimal32Array>();
+                    if let Some(arr) = arr {
+                        let min = arrow::compute::min(arr);
+                        let max = arrow::compute::max(arr);
+                        let is_constant = min.is_some() && min == max && arr.len() > 0;
+                        let is_sorted = Self::check_sorted(arr);
+                        (
+                            min.map(|v| serde_json::json!(v)),
+                            max.map(|v| serde_json::json!(v)),
+                            is_sorted,
+                            is_constant,
+                        )
+                    } else {
+                        (None, None, false, false)
+                    }
+                }
+                DataType::Decimal64(_precision, _scale) => {
+                    let arr = array.as_any().downcast_ref::<Decimal64Array>();
+                    if let Some(arr) = arr {
+                        let min = arrow::compute::min(arr);
+                        let max = arrow::compute::max(arr);
+                        let is_constant = min.is_some() && min == max && arr.len() > 0;
+                        let is_sorted = Self::check_sorted(arr);
+                        (
+                            min.map(|v| serde_json::json!(v)),
+                            max.map(|v| serde_json::json!(v)),
+                            is_sorted,
+                            is_constant,
+                        )
+                    } else {
+                        (None, None, false, false)
+                    }
+                }
+                DataType::Decimal128(_precision, _scale) => {
+                    let arr = array.as_any().downcast_ref::<Decimal128Array>();
+                    if let Some(arr) = arr {
+                            let min = arrow::compute::min(arr);
+                        let max = arrow::compute::max(arr);
+                        let is_constant = min.is_some() && min == max && arr.len() > 0;
+                        let is_sorted = Self::check_sorted(arr);
+                        (
+                            min.map(|v| serde_json::json!(v)),
+                            max.map(|v| serde_json::json!(v)),
+                            is_sorted,
+                            is_constant,
+                        )
+                    } else {
+                        (None, None, false, false)
+                    }
+                }
+                DataType::Decimal256(_precision, _scale) => {
+                    let arr = array.as_any().downcast_ref::<Decimal256Array>();
+                    if let Some(arr) = arr {
+                        let min = arr.iter().flatten().min();
+                        let max = arr.iter().flatten().max();
+                        let is_constant = min.is_some() && min == max && arr.len() > 0;
+                        let is_sorted = Self::check_sorted(arr);
+                        (
+                            min.map(|v| serde_json::json!(v.to_string())),
+                            max.map(|v| serde_json::json!(v.to_string())),
                             is_sorted,
                             is_constant,
                         )
@@ -270,13 +376,20 @@ impl Fragment {
         Ok(stats)
     }
 
-    /// Check if an Int32Array is sorted in ascending order
-    fn check_sorted_i32(arr: &arrow::array::Int32Array) -> bool {
+    /// Check if a PrimitiveArray is sorted in ascending order
+    /// 
+    /// This generic function replaces the type-specific check_sorted_* functions
+    /// for Int32, Int64, Float32, and Float64 arrays.
+    fn check_sorted<T>(arr: &arrow::array::PrimitiveArray<T>) -> bool
+    where
+        T: arrow::array::ArrowPrimitiveType,
+        T::Native: PartialOrd,
+    {
         use arrow::array::Array;
         if arr.len() <= 1 {
             return true;
         }
-        let mut prev: Option<i32> = None;
+        let mut prev: Option<T::Native> = None;
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 continue;
@@ -292,57 +405,15 @@ impl Fragment {
         true
     }
 
-    /// Check if an Int64Array is sorted in ascending order
-    fn check_sorted_i64(arr: &arrow::array::Int64Array) -> bool {
+    /// Check if a UTF-8 array (utf8 or largeutf8) is sorted in ascending order
+    fn check_sorted_utf8_generic<O: arrow::array::OffsetSizeTrait>(
+        arr: &arrow::array::GenericStringArray<O>,
+    ) -> bool {
         use arrow::array::Array;
         if arr.len() <= 1 {
             return true;
         }
-        let mut prev: Option<i64> = None;
-        for i in 0..arr.len() {
-            if arr.is_null(i) {
-                continue;
-            }
-            let val = arr.value(i);
-            if let Some(p) = prev {
-                if val < p {
-                    return false;
-                }
-            }
-            prev = Some(val);
-        }
-        true
-    }
-
-    /// Check if a Float32Array is sorted in ascending order
-    fn check_sorted_f32(arr: &arrow::array::Float32Array) -> bool {
-        use arrow::array::Array;
-        if arr.len() <= 1 {
-            return true;
-        }
-        let mut prev: Option<f32> = None;
-        for i in 0..arr.len() {
-            if arr.is_null(i) {
-                continue;
-            }
-            let val = arr.value(i);
-            if let Some(p) = prev {
-                if val < p {
-                    return false;
-                }
-            }
-            prev = Some(val);
-        }
-        true
-    }
-
-    /// Check if a Float64Array is sorted in ascending order
-    fn check_sorted_f64(arr: &arrow::array::Float64Array) -> bool {
-        use arrow::array::Array;
-        if arr.len() <= 1 {
-            return true;
-        }
-        let mut prev: Option<f64> = None;
+        let mut prev: Option<&str> = None;
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 continue;

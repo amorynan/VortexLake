@@ -28,6 +28,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::DataFusionError;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::object_store::ObjectStoreUrl;
 // Use object_store directly (version 0.12 matches DataFusion 51)
@@ -662,8 +663,11 @@ impl VortexLakeTableProvider {
         }
     }
 
-    /// Build PartitionedFile list from pruned fragments
+    /// Build PartitionedFile list from pruned fragments.
+    /// Attach per-file Statistics so DataFusion FilePruner / Zone Map can work.
     fn build_partitioned_files(&self, fragments: &[FragmentMetadata]) -> Vec<PartitionedFile> {
+        use datafusion_common::stats::Precision;
+        use datafusion_common::{ColumnStatistics, Statistics};
         use object_store::path::Path as ObjectPath;
         
         fragments
@@ -690,6 +694,54 @@ impl VortexLakeTableProvider {
                     actual_size = actual_file_size,
                     "Building PartitionedFile"
                 );
+
+                // Build column statistics in schema order
+                let mut df_col_stats: Vec<ColumnStatistics> =
+                    Vec::with_capacity(self.schema.fields().len());
+                for field in self.schema.fields().iter() {
+                    let col_stats = frag.column_stats.get(field.name());
+
+                    let null_count = col_stats
+                        .map(|cs| Precision::Exact(cs.null_count))
+                        .unwrap_or(Precision::Absent);
+
+                    let min_value = col_stats
+                        .and_then(|cs| cs.min_value.as_ref())
+                        .and_then(|v| Self::json_to_scalar(v, field.data_type()))
+                        .map(Precision::Exact)
+                        .unwrap_or(Precision::Absent);
+
+                    let max_value = col_stats
+                        .and_then(|cs| cs.max_value.as_ref())
+                        .and_then(|v| Self::json_to_scalar(v, field.data_type()))
+                        .map(Precision::Exact)
+                        .unwrap_or(Precision::Absent);
+
+                    tracing::info!(
+                        "PartitionedFile stats: table={} col={} min={:?} max={:?} nulls={:?}",
+                        self.table_name,
+                        field.name(),
+                        min_value,
+                        max_value,
+                        null_count
+                    );
+
+                    df_col_stats.push(ColumnStatistics {
+                        null_count,
+                        distinct_count: Precision::Absent,
+                        min_value,
+                        max_value,
+                        sum_value: Precision::Absent,
+                    });
+                }
+
+                let statistics = Statistics {
+                    num_rows: Precision::Exact(frag.row_count),
+                    total_byte_size: Precision::Exact(actual_file_size as usize),
+                    column_statistics: df_col_stats,
+                };
+
+                tracing::info!("statistics: {:?}", statistics);
                 
                 PartitionedFile {
                     object_meta: ObjectMeta {
@@ -701,10 +753,11 @@ impl VortexLakeTableProvider {
                     },
                     partition_values: vec![],
                     range: None,
-                    statistics: None,
+                    statistics: Some(Arc::new(statistics)),
                     extensions: None,
                     metadata_size_hint: None,
                 }
+                
             })
             .collect()
     }
@@ -1005,9 +1058,19 @@ impl TableProvider for VortexLakeTableProvider {
         // - Opening Vortex files
         // - Zone Map pruning within files (now with pushed-down filters)
         // - Efficient columnar scanning
-        self.vortex_format
-            .create_physical_plan(state, file_scan_config)
-            .await
+        // let source = VortexSource::new(self.session.clone(), self.file_cache.clone());
+        // let source = Arc::new(source);
+
+        // Ok(DataSourceExec::from_data_source(
+        //     FileScanConfigBuilder::from(file_scan_config)
+        //         .with_source(source)
+        //         .build(),
+        // ))
+        // 直接使用 file_scan_config，它已经包含了 file_source_with_filters
+        Ok(DataSourceExec::from_data_source(file_scan_config))
+        // self.vortex_format
+        //     .create_physical_plan(state, file_scan_config)
+        //     .await
     }
 }
 

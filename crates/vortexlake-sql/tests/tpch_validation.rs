@@ -21,6 +21,8 @@
 
 use std::sync::Arc;
 use std::time::Instant;
+#[path = "common.rs"]
+mod common;
 
 use arrow::array::{
     ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
@@ -49,26 +51,9 @@ use tpchgen_arrow::{
 use vortexlake_core::{VortexLake, Schema as VLSchema, Field as VLField};
 use vortexlake_sql::table_provider::VortexLakeTableProvider;
 
-/// Initialize tracing subscriber for test logging
-/// 
-/// Log level can be controlled via RUST_LOG environment variable:
-/// - RUST_LOG=vortexlake_sql=info (default for tests)
-/// - RUST_LOG=vortexlake_sql=debug (more verbose)
-/// - RUST_LOG=info (all crates at info level)
+/// Initialize tracing subscriber for test logging (shared helper)
 fn init_test_logging() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    
-    INIT.call_once(|| {
-        // Use RUST_LOG if set, otherwise default to info level for vortexlake_sql
-        let default_filter = std::env::var("RUST_LOG")
-            .unwrap_or_else(|_| "vortexlake_sql=info".to_string());
-        
-        tracing_subscriber::fmt()
-            .with_env_filter(default_filter)
-            .with_test_writer()
-            .init();
-    });
+    common::init_test_logging("tpch_validation.log");
 }
 
 /// TPC-H Scale Factor for tests (0.01 = ~6MB data, 0.1 = ~60MB, 1.0 = ~600MB)
@@ -77,18 +62,7 @@ const SCALE_FACTOR: f64 = 0.1;
 /// Test data directory (persistent, not deleted after tests)
 /// Uses absolute path to avoid URL encoding issues with ObjectPath
 fn get_test_data_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target/test_data")
-        .canonicalize()
-        .unwrap_or_else(|_| {
-            // If canonicalize fails (dir doesn't exist), create and return the path
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join("target/test_data");
-            std::fs::create_dir_all(&path).ok();
-            path.canonicalize().unwrap_or(path)
-        })
+    common::get_test_data_dir()
 }
 
 // ============================================================================
@@ -1549,7 +1523,7 @@ async fn setup_vortexlake_session_all(db_path: &std::path::Path, tables: &[&str]
 #[ignore] // Run with: cargo test -p vortexlake-sql complete_tpch_benchmark -- --nocapture --ignored
 async fn complete_tpch_benchmark() -> anyhow::Result<()> {
     // Initialize logging (respects RUST_LOG env var, defaults to vortexlake_sql=info)
-    init_test_logging();
+    // init_test_logging();
     
     println!("\n{}", "=".repeat(80));
     println!("Complete TPC-H Benchmark (All Tables, All Queries)");
@@ -1737,7 +1711,7 @@ async fn profile_q22() -> anyhow::Result<()> {
     println!("Q22 Performance Profiling");
     println!("{}", "=".repeat(80));
 
-    // init_test_logging();
+    init_test_logging();
     
     // Check if test data exists
     let base_dir = get_test_data_dir();
