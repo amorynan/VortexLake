@@ -5,6 +5,7 @@
 //! - Layer 2: Vortex Zone Map pruning (delegated to vortex-datafusion)
 
 use std::sync::Arc;
+use std::fs;
 
 use arrow::array::{Float32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -12,8 +13,12 @@ use arrow::record_batch::RecordBatch;
 use tempfile::tempdir;
 use vortexlake_core::{Field as VLField, Schema, VortexLake};
 use vortexlake_sql::VortexLakeTableProvider;
+#[path = "common.rs"]
+mod common;
 // Import TableProvider trait to access schema() method
 use datafusion::datasource::TableProvider;
+use datafusion::prelude::SessionContext;
+use vortexlake_sql::profiling::execute_with_full_profile;
 
 /// Helper function to create a batch with sequential IDs
 fn create_batch_with_range(start_id: i64, count: usize) -> RecordBatch {
@@ -30,7 +35,7 @@ fn create_batch_with_range(start_id: i64, count: usize) -> RecordBatch {
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int64Array::from(ids)),
+            Arc::new(Int64Array::from(ids)),    
             Arc::new(StringArray::from(names)),
             Arc::new(Float32Array::from(scores)),
         ],
@@ -100,6 +105,178 @@ async fn test_manifest_pruning_with_multiple_fragments() {
     let frag3_stats = fragments[2].column_stats.get("id").unwrap();
     assert_eq!(frag3_stats.min_value, Some(serde_json::json!(200)));
     assert_eq!(frag3_stats.max_value, Some(serde_json::json!(299)));
+}
+
+/// Zone Map pruning should skip row groups when min/max are disjoint.
+#[tokio::test]
+async fn test_zone_map_row_group_pruning() {
+    common::init_test_logging("pruning_tests.log");
+    let base_dir = common::get_test_data_dir().join("zone_map_test");
+    let db_path = base_dir.join("testdb");
+    let _ = fs::remove_dir_all(&base_dir);
+    fs::create_dir_all(&db_path).unwrap();
+
+    // Build data with two disjoint ranges in a single fragment (>8K rows to form multiple RGs)
+    // RG1: 0..9999  (will match filter id < 100)
+    // RG2: 1_000_000..1_009_999 (should be pruned)
+    let low_range: Vec<i64> = (0..10_000).collect();
+    let high_range: Vec<i64> = (1_000_000..1_010_000).collect();
+    let ids: Vec<i64> = low_range.into_iter().chain(high_range.into_iter()).collect();
+    let scores: Vec<f32> = ids.iter().map(|v| *v as f32).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Arc::new(Field::new("id", DataType::Int64, false)),
+        Arc::new(Field::new("score", DataType::Float32, false)),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Float32Array::from(scores)),
+        ],
+    )
+    .unwrap();
+
+    // Write a single fragment
+    let db = VortexLake::new(&db_path).await.unwrap();
+    let vl_schema = Schema::new(vec![
+        VLField::new("id", DataType::Int64, false),
+        VLField::new("score", DataType::Float32, false),
+    ])
+    .unwrap();
+    db.create_table("t", vl_schema).await.unwrap();
+    let mut writer = db.writer("t").unwrap();
+    writer.write_batch(batch).await.unwrap();
+    writer.commit().await.unwrap();
+
+    // Register provider
+    let provider = VortexLakeTableProvider::new(db_path.to_str().unwrap(), "t")
+        .await
+        .unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    // Run query with selective predicate; expect to prune the high range
+    let sql = "SELECT count(*) as c FROM t WHERE id < 100";
+    let (_batches, profile) = execute_with_full_profile(&ctx, sql).await.unwrap();
+
+    // Verify result rows = 1 row with count 100
+    let rows: usize = _batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 1);
+    let count_val = _batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count_val, 100);
+
+    // Collect DataSource metrics to confirm pruning
+    fn collect_pruning(metrics: &mut (usize, usize, usize), node: &vortexlake_sql::profiling::PlanNode) {
+        if node.operator_name.contains("DataSource") {
+            if let Some(rg_pruned) = node.metrics.row_groups_pruned_statistics {
+                metrics.0 += rg_pruned;
+            }
+            if let Some(rows_pruned) = node.metrics.pushdown_rows_pruned {
+                metrics.1 += rows_pruned;
+            }
+            if let Some(bytes) = node.metrics.bytes_scanned {
+                metrics.2 += bytes;
+            }
+        }
+        for c in &node.children {
+            collect_pruning(metrics, c);
+        }
+    }
+    let mut agg = (0_usize, 0_usize, 0_usize);
+    collect_pruning(&mut agg, &profile.plan_tree);
+
+    // Expect some row groups or rows pruned (Zone Map / file-level pruning)
+    assert!(
+        agg.0 > 0 || agg.1 > 0,
+        "Expected row groups or rows pruned by zone map/file pruning"
+    );
+    // Bytes scanned should be >0 but significantly less than full table (~20k rows)
+    assert!(agg.2 > 0);
+}
+
+/// FilePruner should skip whole fragments when min/max are disjoint.
+/// Fragment1: id in [0, 999]; Fragment2: id in [10_000, 10_999].
+/// Filter: id < 500 -> should only read fragment1.
+#[tokio::test]
+async fn test_file_pruner_fragment_pruning() {
+    common::init_test_logging("file_pruning_tests.log");
+    let base_dir = common::get_test_data_dir().join("file_pruner_test");
+    let db_path = base_dir.join("testdb");
+    let _ = fs::remove_dir_all(&base_dir);
+    fs::create_dir_all(&db_path).unwrap();
+
+    // Build two non-overlapping fragments
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Arc::new(Field::new("id", DataType::Int64, false)),
+    ]));
+
+    // frag1: 0..999
+    let batch1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from((0..1000).collect::<Vec<_>>()))],
+    )
+    .unwrap();
+
+    // frag2: 10_000..10_999
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from((10_000..11_000).collect::<Vec<_>>()))],
+    )
+    .unwrap();
+
+    let db = VortexLake::new(&db_path).await.unwrap();
+    let vl_schema = Schema::new(vec![VLField::new("id", DataType::Int64, false)]).unwrap();
+    db.create_table("t", vl_schema).await.unwrap();
+
+    // Write frag1
+    let mut writer = db.writer("t").unwrap();
+    writer.write_batch(batch1).await.unwrap();
+    writer.commit().await.unwrap();
+
+    // Write frag2
+    let mut writer = db.writer("t").unwrap();
+    writer.write_batch(batch2).await.unwrap();
+    writer.commit().await.unwrap();
+
+    let provider = VortexLakeTableProvider::new(db_path.to_str().unwrap(), "t")
+        .await
+        .unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    let sql = "SELECT count(*) as c FROM t WHERE id < 500";
+    let (_batches, profile) = execute_with_full_profile(&ctx, sql).await.unwrap();
+
+    // Expect count = 500
+    let rows: usize = _batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 1);
+    let cnt = _batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(cnt, 500);
+
+    // Check that only one fragment/file was effectively scanned
+    fn count_scans(node: &vortexlake_sql::profiling::PlanNode) -> usize {
+        let mut c = 0;
+        if node.operator_name.contains("DataSource") {
+            c += 1;
+        }
+        for ch in &node.children {
+            c += count_scans(ch);
+        }
+        c
+    }
+    let datasource_nodes = count_scans(&profile.plan_tree);
+    assert_eq!(datasource_nodes, 1, "Expected only one fragment to be scanned");
 }
 
 #[tokio::test]

@@ -916,7 +916,7 @@ impl TableProvider for VortexLakeTableProvider {
             tracing::info!(
                 "[{}] Row filtering will happen at Layer 2 (Zone Map) and Layer 3 (DataFusion Filter).",
                 self.table_name
-            );
+        );
         }
 
         if pruned_fragments.is_empty() {
