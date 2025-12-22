@@ -34,12 +34,13 @@ pub mod file_source;
 pub mod profiling;
 pub mod session;
 pub mod table_provider;
+pub mod metrics_config;
 
 pub use file_source::{PruningStats, VortexLakeFileList};
 pub use profiling::{execute_with_full_profile, compare_profiles, export_profile_json, QueryProfile};
 pub use session::{QueryResult, Session};
 pub use table_provider::VortexLakeTableProvider;
-
+pub use metrics_config::{MetricsIsolationMode, VortexMetricsConfig};
 /// Initialize the VortexLake SQL environment
 pub async fn init() -> anyhow::Result<()> {
     // Initialize DataFusion context with VortexLake extensions

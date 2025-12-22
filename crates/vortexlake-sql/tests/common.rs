@@ -2,7 +2,17 @@ use std::sync::Once;
 
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::fmt::time;
+use tracing_subscriber::fmt::format::Writer;
+use chrono::Local;
+use std::fmt::Result;
 
+struct LocalTime;
+impl time::FormatTime for LocalTime {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))
+    }
+}
 static INIT: Once = Once::new();
 static mut GUARD: Option<tracing_appender::non_blocking::WorkerGuard> = None;
 
@@ -24,7 +34,7 @@ pub fn init_test_logging(log_file: &str) {
             .with_target(false)
             .with_file(true)
             .with_line_number(true)
-            .without_time()
+            .with_timer(LocalTime)
             .try_init();
 
         // Keep guard alive to flush logs

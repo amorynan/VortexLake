@@ -19,6 +19,7 @@
 //! 2. Query result consistency
 //! 3. Relative performance (Vortex vs Parquet)
 
+use std::fs;
 use std::sync::Arc;
 use std::time::Instant;
 #[path = "common.rs"]
@@ -48,7 +49,7 @@ use tpchgen_arrow::{
 };
 
 // VortexLake imports
-use vortexlake_core::{VortexLake, Schema as VLSchema, Field as VLField};
+use vortexlake_core::{VortexLake, VortexLakeWriteConfig, Schema as VLSchema, Field as VLField};
 use vortexlake_sql::table_provider::VortexLakeTableProvider;
 
 /// Initialize tracing subscriber for test logging (shared helper)
@@ -1702,6 +1703,8 @@ fn calculate_vortex_size(dir: &std::path::Path) -> anyhow::Result<u64> {
     Ok(total)
 }
 
+
+
 /// Profile Q22 query to identify performance bottlenecks
 #[tokio::test]
 #[ignore] // Run with: cargo test -p vortexlake-sql profile_q22 -- --nocapture --ignored
@@ -1746,17 +1749,18 @@ async fn profile_q22() -> anyhow::Result<()> {
     
     println!("\n--- Parquet Profile ---");
     let (parquet_results, parquet_profile) = execute_with_full_profile(&parquet_ctx, TPCH_Q22).await?;
-    parquet_profile.print();
+    use vortexlake_sql::metrics_config::VortexMetricsConfig;
+    parquet_profile.print(&VortexMetricsConfig::default());
     println!("\nParquet result rows: {}", parquet_results.iter().map(|b| b.num_rows()).sum::<usize>());
     
     println!("\n--- VortexLake Profile (default) ---");
     let (vortex_results, vortex_profile) = execute_with_full_profile(&vortex_ctx, TPCH_Q22).await?;
-    vortex_profile.print();
+    vortex_profile.print(&VortexMetricsConfig::default());
     println!("\nVortexLake result rows: {}", vortex_results.iter().map(|b| b.num_rows()).sum::<usize>());
     
     println!("\n--- VortexLake Profile (forced CollectLeft) ---");
     let (vortex_forced_results, vortex_forced_profile) = execute_with_full_profile(&vortex_ctx_forced, TPCH_Q22).await?;
-    vortex_forced_profile.print();
+    vortex_forced_profile.print(&VortexMetricsConfig::default());
     println!("\nVortexLake (forced) result rows: {}", vortex_forced_results.iter().map(|b| b.num_rows()).sum::<usize>());
     
     // Compare profiles using the comprehensive comparison tool
@@ -1798,4 +1802,3 @@ async fn profile_q22() -> anyhow::Result<()> {
     
     Ok(())
 }
-

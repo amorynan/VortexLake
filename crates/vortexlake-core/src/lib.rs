@@ -102,6 +102,11 @@ impl VortexLake {
         Writer::new(self.path.clone(), table_name, self.manifest.clone())
     }
 
+    /// Get a writer for batch ingestion with custom configuration
+    pub fn writer_with_config(&self, table_name: &str, config: VortexLakeWriteConfig) -> Result<Writer> {
+        Writer::new_with_config(self.path.clone(), table_name, self.manifest.clone(), config)
+    }
+
     /// Get a reader for querying data
     pub fn reader(&self, table_name: &str) -> Result<Reader> {
         Reader::new(self.path.clone(), table_name, self.manifest.clone())

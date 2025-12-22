@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 use crate::fragment::Fragment;
 use crate::manifest::Manifest;
 use crate::schema::Schema;
+use crate::VortexLakeWriteConfig;
 
 /// Batch writer for data ingestion
 pub struct Writer {
@@ -24,6 +25,8 @@ pub struct Writer {
     schema: Schema,
     /// Path for manifest persistence
     manifest_path: PathBuf,
+    /// Write configuration
+    config: VortexLakeWriteConfig,
 }
 
 impl Writer {
@@ -32,6 +35,16 @@ impl Writer {
         base_path: PathBuf,
         table_name: &str,
         manifest: Arc<RwLock<Manifest>>,
+    ) -> Result<Self> {
+        Self::new_with_config(base_path, table_name, manifest, VortexLakeWriteConfig::default())
+    }
+
+    /// Create a new writer for a table with custom configuration
+    pub fn new_with_config(
+        base_path: PathBuf,
+        table_name: &str,
+        manifest: Arc<RwLock<Manifest>>,
+        config: VortexLakeWriteConfig,
     ) -> Result<Self> {
         let manifest_read = manifest.try_read().map_err(|_| anyhow!("Manifest is locked"))?;
         let schema = manifest_read
@@ -47,6 +60,7 @@ impl Writer {
             max_buffer_size: 100_000, // Default buffer size
             schema,
             manifest_path,
+            config,
         })
     }
 
@@ -102,8 +116,8 @@ impl Writer {
         // Ensure data directory exists
         tokio::fs::create_dir_all(fragment_path.parent().unwrap()).await?;
 
-        // Write fragment using Vortex format
-        fragment.write_data_to_path(&fragment_path, &combined_batch).await?;
+        // Write fragment using Vortex format with custom configuration
+        fragment.write_data_to_path_with_config(&fragment_path, &combined_batch, &self.config).await?;
 
         // Update manifest and persist to disk
         {

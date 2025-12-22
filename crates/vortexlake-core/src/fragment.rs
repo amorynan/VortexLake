@@ -19,10 +19,11 @@ use vortex_array::arrow::FromArrowArray;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_array::ArrayRef;
 use vortex_file::VortexFile;
-use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
+use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex_session::VortexSession;
 
 use crate::manifest::ColumnStats;
+use crate::VortexLakeWriteConfig;
 
 /// A physical fragment containing columnar data in Vortex format
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,12 +80,16 @@ impl Fragment {
 
     /// Write fragment data to a file path using Vortex format
     pub async fn write_data_to_path(&self, path: &Path, batch: &RecordBatch) -> Result<()> {
+        self.write_data_to_path_with_config(path, batch, &VortexLakeWriteConfig::default()).await
+    }
+
+    pub async fn write_data_to_path_with_config(&self, path: &Path, batch: &RecordBatch, config: &VortexLakeWriteConfig) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
 
-        // Create Vortex session with default configuration
+        // Create Vortex session with custom configuration
         let session = VortexSession::default();
 
         // Convert Arrow RecordBatch to Vortex Array
@@ -92,10 +97,16 @@ impl Fragment {
         let nullable = batch.schema().fields().iter().any(|f| f.is_nullable());
         let vortex_array: ArrayRef = ArrayRef::from_arrow(batch, nullable);
 
-        // Write using Vortex file format
+        // Create custom write strategy with configured row block size
+        let strategy = WriteStrategyBuilder::new()
+            .with_row_block_size(config.row_block_size)
+            .build();
+
+        // Write using Vortex file format with custom strategy
         let mut file = tokio::fs::File::create(path).await?;
         session
             .write_options()
+            .with_strategy(strategy)
             .write(&mut file, vortex_array.to_array_stream())
             .await?;
 

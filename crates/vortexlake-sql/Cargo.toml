@@ -50,6 +50,8 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Logging
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # Local crate dependencies
 vortexlake-core = { path = "../vortexlake-core" }

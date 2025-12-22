@@ -40,6 +40,9 @@ use vortex_datafusion::{VortexFormat, VortexOptions};
 // FileFormat trait needed for create_physical_plan
 use datafusion_datasource::file_format::FileFormat;
 use vortex_session::VortexSession;
+// Vortex file and layout types (re-exported from vortex crate with "files" feature)
+use vortex::file::OpenOptionsSessionExt;
+use vortex::layout::layouts::zoned::ZonedVTable;
 use vortexlake_core::manifest::FragmentMetadata;
 use vortexlake_core::VortexLake;
 
@@ -760,6 +763,90 @@ impl VortexLakeTableProvider {
                 
             })
             .collect()
+    }
+
+    /// Log ZoneMap pruning information for verification
+    /// This helps verify that ZoneMap pruning is working correctly
+    async fn log_zone_map_pruning_info(
+        &self,
+        fragments: &[FragmentMetadata],
+        physical_filters: &[Arc<dyn datafusion::physical_expr::PhysicalExpr>],
+    ) {
+        if fragments.is_empty() || physical_filters.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "[{}] ZoneMap Pruning: Checking {} fragment(s) with {} filter(s)",
+            self.table_name,
+            fragments.len(),
+            physical_filters.len()
+        );
+
+        // For each fragment, try to read ZoneMap and log pruning info
+        for frag in fragments.iter().take(3) { // Limit to first 3 fragments to avoid too much logging
+            let file_path = self.base_path.join(&frag.path);
+            if !file_path.exists() {
+                tracing::debug!("[{}] File not found: {:?}", self.table_name, file_path);
+                continue;
+            }
+
+            // Convert PathBuf to &Path for open()
+            let file_path_ref: &std::path::Path = file_path.as_ref();
+            match self.vortex_session
+                .open_options()
+                .open(file_path_ref)
+                .await
+            {
+                Ok(vxf) => {
+                    // Check if using ZonedLayout by checking the layout in the footer
+                    let layout = vxf.footer().layout();
+                    if layout.is::<ZonedVTable>() {
+                        // Get zone information from ZonedLayout
+                        let zoned_layout = layout.as_::<ZonedVTable>();
+                        let num_zones = zoned_layout.nzones();
+                        let row_count = zoned_layout.row_count();
+                        // Estimate zone_len from row_count and num_zones
+                        let estimated_zone_len = if num_zones > 0 {
+                            (row_count as f64 / num_zones as f64).ceil() as usize
+                        } else {
+                            8192 // Default zone_len (should be read from config, not hardcoded)
+                        };
+                        tracing::info!(
+                            "[{}] ZoneMap available: file={:?}, zones={}, estimated_zone_len={} ({} rows per zone), total_rows={}",
+                            self.table_name,
+                            frag.path,
+                            num_zones,
+                            estimated_zone_len,
+                            estimated_zone_len,
+                            row_count
+                        );
+                        
+                        // Key understanding: ZoneMap is LOGICAL (every 8k rows), not physical
+                        // - Segments are arbitrary byte buffers (could be 8k, 10, or 8M rows)
+                        // - ZoneMap pruning works at logical row group level (8k rows)
+                        // - This works because Vortex compression codecs support random access
+                        // - Actual pruning happens in VortexOpener via ScanBuilder
+                        // - The filter is already passed to ScanBuilder, which will use ZonedReader's pruning
+                        tracing::info!(
+                            "[{}] ZoneMap pruning (LOGICAL, every {} rows) will be handled by VortexOpener/ScanBuilder for file: {:?}",
+                            self.table_name,
+                            estimated_zone_len,
+                            frag.path
+                        );
+                    } else {
+                        tracing::debug!(
+                            "[{}] File does not use ZonedLayout: {:?}",
+                            self.table_name,
+                            frag.path
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("[{}] Failed to open file: {}", self.table_name, e);
+                }
+            }
+        }
     }
 
     /// Build file groups from partitioned files

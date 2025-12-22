@@ -11,10 +11,12 @@ use std::time::{Duration, Instant};
 
 use datafusion::prelude::SessionContext;
 use datafusion_physical_plan::{
-    ExecutionPlan, 
+    ExecutionPlan,
     metrics::MetricsSet,
 };
 use futures::TryStreamExt;
+
+use crate::metrics_config::{VortexMetricsConfig};
 
 /// Comprehensive query profile with detailed operator-level metrics
 #[derive(Debug, Clone)]
@@ -55,67 +57,220 @@ pub struct PlanNode {
 
 /// Detailed metrics for a single operator
 #[derive(Debug, Clone, Default)]
+/// Metrics collected for each physical operator in the execution plan.
+/// These metrics help analyze query performance and identify bottlenecks.
+///
+/// ## Metrics Categories:
+/// - **Standard DataFusion Metrics**: Basic operator statistics (CPU time, row counts)
+/// - **I/O Metrics**: Storage access patterns (bytes scanned, pushdown pruning)
+/// - **Vortex-Specific Metrics**: ZoneMap pruning and internal optimization details
+/// - **Time Metrics**: Detailed timing breakdown for performance analysis
+///
+/// ## Key Vortex vs Parquet Differences:
+/// - **ZoneMap Pruning**: Vortex uses logical zones (8k rows) vs Parquet's physical row groups
+/// - **Segment I/O**: Vortex tracks segment-level access vs Parquet's page-level access
+/// - **Metrics Mapping**: rows_pruned_by_statistics ≈ Parquet's row_groups_pruned_statistics
+///
+/// ## Usage Notes:
+/// - All metrics are optional (Option<T>) as not all operators provide all metrics
+/// - Metrics are accumulated across partitions for distributed execution
+/// - Some metrics are specific to certain storage formats (Parquet vs Vortex)
+/// - Vortex-specific metrics only appear in DataSourceExec operators using Vortex
+/// - Standard DataFusion metrics appear in most operators (FilterExec, AggregateExec, etc.)
+/// - ⚠️ Four fields marked as "POTENTIALLY UNUSED" should be reviewed for removal
+///
+/// ## Operator-Specific Metrics:
+/// - **DataSourceExec**: All I/O and Vortex-specific metrics
+/// - **FilterExec**: input_rows, output_rows, rows_filtered, selectivity
+/// - **AggregateExec**: output_rows (input_rows may be from children)
+/// - **JoinExec**: output_rows (may have left/right input tracking)
+/// - **SortExec**: output_rows (input_rows = output_rows for sorting)
+///
+/// ## Future Improvements:
+/// - Remove unused fields (start_time, end_time, memory_usage, partition)
+/// - Add memory tracking integration with DataFusion
+/// - Standardize Vortex metrics with DataFusion's metric system
 pub struct OperatorMetrics {
-    /// CPU time spent in this operator
+    // === Standard DataFusion Metrics ===
+
+    /// CPU time spent in this operator (from DataFusion's baseline metrics)
+    /// Used for: Performance profiling, operator cost estimation
     pub elapsed_compute: Option<Duration>,
-    
-    /// Total output rows
+
+    /// Total rows produced as output by this operator
+    /// Used for: Understanding data flow, verifying correctness
     pub output_rows: Option<usize>,
-    
-    /// Input rows (if available) - used to calculate filter selectivity
+
+    /// Input rows fed into this operator (calculated from children, not directly measured)
+    /// Used for: Filter selectivity calculation, data reduction analysis
     pub input_rows: Option<usize>,
-    
-    /// Rows filtered out (for FilterExec: input_rows - output_rows)
+
+    /// Rows filtered out by FilterExec (input_rows - output_rows)
+    /// Used for: Filter effectiveness measurement
     pub rows_filtered: Option<usize>,
-    
+
     /// Filter selectivity ratio (output_rows / input_rows)
+    /// Used for: Filter efficiency analysis (higher = more selective)
     pub selectivity: Option<f64>,
-    
-    /// Spilled bytes to disk
+
+    /// Bytes spilled to disk during execution (for memory-intensive operators)
+    /// Used for: Memory pressure analysis, spill detection
     pub spilled_bytes: Option<usize>,
-    
-    /// Spilled rows to disk
+
+    /// Rows spilled to disk during execution
+    /// Used for: Memory management analysis
     pub spilled_rows: Option<usize>,
-    
+
     // === I/O and Scan Metrics (from Parquet/Vortex) ===
-    
-    /// Bytes scanned from storage
+
+    /// Total bytes scanned from storage (physical I/O)
+    /// Used for: I/O efficiency analysis, storage access patterns
     pub bytes_scanned: Option<usize>,
-    
-    /// Rows pruned by pushdown predicates
+
+    /// Rows pruned by pushdown predicates (before data materialization)
+    /// Used for: Predicate pushdown effectiveness
     pub pushdown_rows_pruned: Option<usize>,
-    
-    /// Rows matched by pushdown predicates
+
+    /// Rows that matched pushdown predicates (and were kept)
+    /// Used for: Pushdown selectivity analysis
     pub pushdown_rows_matched: Option<usize>,
-    
-    /// Row groups pruned by statistics
+
+    /// Row groups pruned by file-level statistics (Parquet/Vortex)
+    /// Used for: File pruning effectiveness
     pub row_groups_pruned_statistics: Option<usize>,
-    
-    /// Row groups matched by statistics
+
+    /// Row groups that matched file-level statistics
+    /// Used for: File-level selectivity analysis
     pub row_groups_matched_statistics: Option<usize>,
-    
+
     /// Time spent evaluating row-level pushdown filters
+    /// Used for: Pushdown performance cost analysis
     pub row_pushdown_eval_time: Option<Duration>,
-    
-    /// Time spent loading metadata
+
+    /// Time spent loading metadata (schema, statistics, etc.)
+    /// Used for: Metadata loading overhead analysis
     pub metadata_load_time: Option<Duration>,
-    
-    /// Page index rows pruned
+
+    /// Rows pruned by page-level indexes (Parquet specific)
+    /// Used for: Fine-grained pruning analysis
     pub page_index_rows_pruned: Option<usize>,
     
-    /// All other metrics (name -> value as string)
+    // === Vortex Logical Pruning Metrics (核心差异层) ===
+    // Vortex使用逻辑ZoneMap (每8k行) 而不是物理segment统计
+    // 这些metrics展示ZoneMap剪枝的详细效果
+
+    /// Total logical row windows participating in scan (total_rows / ZONE_LEN rounded up)
+    /// ZONE_LEN = 8192 (8k rows per zone)
+    /// Used for: Understanding ZoneMap coverage, pruning denominator
+    pub logical_windows_total: Option<usize>,
+
+    /// Logical windows pruned by ZoneMapLayout min/max statistics
+    /// Equivalent to Parquet's row_groups_pruned_statistics
+    /// Used for: ZoneMap pruning effectiveness measurement
+    pub logical_windows_pruned_statistics: Option<usize>,
+
+    /// Final logical windows that need to be scanned after pruning
+    /// Formula: logical_windows_selected = logical_windows_total - logical_windows_pruned_statistics
+    /// Used for: Post-pruning scan scope analysis
+    pub logical_windows_selected: Option<usize>,
+
+    /// Theoretical rows skipped by ZoneMap pruning (estimated)
+    /// **Source**: vortex-scan/src/tasks.rs:118 `rows_pruned_by_statistics.add(pruned_rows)`
+    /// Formula: pruned_rows = original_mask_len - remaining_true_count
+    /// Used for: Quantifying pruning benefit in row count, ZoneMap effectiveness measurement
+    pub rows_pruned_by_statistics: Option<usize>,
+
+    // === Vortex Segment / IO Metrics (Vortex 特有) ===
+    // Vortex的物理存储单元是segments，展示实际I/O模式
+
+    /// Number of segments that were touched (at least one slice read)
+    /// **Source**: vortex-scan/src/tasks.rs:160 `segments_touched.add(1)` during filter evaluation
+    /// Vortex segments are physical storage units (compressed data blocks)
+    /// Used for: Physical I/O distribution analysis, measuring segment access efficiency
+    pub segments_touched: Option<usize>,
+
+    /// Number of segment slice read operations executed
+    /// **Source**: vortex-scan/src/tasks.rs:192 `segment_slices_read.add(1)` after projection_evaluation
+    /// A segment can be divided into multiple slices for parallel processing
+    /// Example: segments_touched:1, segment_slices_read:2 means 1 segment split into 2 slices
+    /// Used for: Parallel I/O analysis, slice efficiency measurement
+    pub segment_slices_read: Option<usize>,
+
+    /// Bytes actually read from segments (compressed state)
+    /// **Source**: vortex-scan/src/tasks.rs:196 `bytes_read_from_segments.add(estimated_bytes)`
+    /// Equivalent to Parquet's bytes_scanned
+    /// Used for: Physical I/O volume measurement, compression ratio analysis
+    pub bytes_read_from_segments: Option<usize>,
+
+    /// Estimated bytes skipped due to logical pruning (no physical I/O)
+    /// Formula: bytes_skipped ≈ rows_pruned * avg_bytes_per_row
+    /// Used for: Pruning efficiency in I/O savings
+    pub bytes_skipped_by_zonemap: Option<usize>,
+
+    // === Vortex Decode / Materialization Metrics ===
+    // 从压缩存储到Arrow Array的转换过程
+
+    /// Rows actually decoded into Arrow Arrays (after compression)
+    /// **Source**: vortex-scan/src/tasks.rs:200 `rows_decoded.add(array.len())`
+    /// **Lifecycle**:
+    ///   1. **Creation**: tasks.rs:49 `let rows_decoded = ctx.metrics.counter("rows_decoded")`
+    ///   2. **Recording**: tasks.rs:200 `rows_decoded.add(array.len())` after projection_evaluation
+    ///   3. **Extraction**: profiling.rs:495-498 collected from VortexMetricsFinder
+    ///   4. **Display**: profiling.rs:849-852 shown in DataSourceExec profile
+    ///
+    /// May differ significantly from output_rows due to:
+    /// - **Pushdown filtering**: Decode first, filter second (vortex-scan pruning logic)
+    /// - **ZoneMap granularity**: Must decode entire 8k-row blocks (8192 rows each)
+    /// - **Query complexity**: Subqueries/JOINs need broader data access
+    /// - **Batch processing**: Arrow RecordBatch boundaries cause over-counting
+    ///
+    /// ⚠️ **Can be >> output_rows** (e.g., 28,596 decoded → 15,000 output after filtering)
+    /// Used for: Measuring decode overhead vs final result size, ZoneMap efficiency analysis
+    pub rows_decoded: Option<usize>,
+
+    /// Number of RecordBatches emitted by ScanExec
+    /// Used for: Batch size and memory efficiency analysis
+    pub record_batches_emitted: Option<usize>,
+
+    // === Vortex Time Metrics ===
+    // 详细的时间分解，便于性能瓶颈识别
+
+    /// Time spent on ZoneMapLayout + predicate evaluation (nanoseconds)
+    /// **Source**: vortex-scan/src/tasks.rs:112 `time_pruning_ns.update(pruning_start.elapsed())`
+    /// Used for: Pruning overhead analysis (should be minimal compared to I/O time)
+    pub time_pruning_ns: Option<Duration>,
+
+    /// Time spent on segment slice reads (nanoseconds)
+    /// Used for: I/O time vs CPU time analysis
+    pub time_io_ns: Option<Duration>,
+
+    /// Time spent on FlatLayout decoding (nanoseconds)
+    /// Used for: Codec performance analysis
+    pub time_decode_ns: Option<Duration>,
+
+    // === Miscellaneous Metrics ===
+
+    /// All other metrics not covered above (name -> value as string)
+    /// Used for: Capturing additional operator-specific metrics
     pub other_metrics: Vec<(String, String)>,
-    
-    /// Start timestamp
+
+    // === POTENTIALLY UNUSED FIELDS ===
+    // These fields are defined but may not be actively used in current profiling
+
+    /// Start timestamp of operator execution
+    /// ⚠️ POTENTIALLY UNUSED: Defined but not populated or used in profiling logic
     pub start_time: Option<chrono::DateTime<chrono::Utc>>,
-    
-    /// End timestamp
+
+    /// End timestamp of operator execution
+    /// ⚠️ POTENTIALLY UNUSED: Defined but not populated or used in profiling logic
     pub end_time: Option<chrono::DateTime<chrono::Utc>>,
-    
-    /// Memory usage (if available)
+
+    /// Memory usage during operator execution
+    /// ⚠️ POTENTIALLY UNUSED: Defined but not populated from DataFusion metrics
     pub memory_usage: Option<usize>,
-    
-    /// Partition information
+
+    /// Partition information for distributed execution
+    /// ⚠️ POTENTIALLY UNUSED: Defined but not populated or used in current implementation
     pub partition: Option<usize>,
 }
 
@@ -198,14 +353,40 @@ impl QueryProfile {
             node_metrics.output_rows = metrics.output_rows();
             node_metrics.spilled_bytes = metrics.spilled_bytes();
             node_metrics.spilled_rows = metrics.spilled_rows();
-            
+
             // Extract elapsed_compute time (returns nanoseconds as usize)
             if let Some(nanos) = metrics.elapsed_compute() {
                 node_metrics.elapsed_compute = Some(Duration::from_nanos(nanos as u64));
             }
-            
+
             // Extract all other metrics from the MetricsSet
             Self::extract_all_metrics(&metrics, &mut node_metrics);
+        }
+
+        // Extract Vortex-specific metrics using VortexMetricsFinder： very details for every metric
+        use vortex_datafusion::metrics::VortexMetricsFinder;
+        let vortex_metrics_sets = VortexMetricsFinder::find_all(&**plan);
+        // println!("🔍 VORTEX METRICS DEBUG: Found {} Vortex metrics sets", vortex_metrics_sets.len());
+
+        // Debug: Check if Vortex metrics are being found
+        if vortex_metrics_sets.is_empty() {
+            tracing::warn!("⚠️ No Vortex metrics sets found for DataSourceExec node");
+        } else {
+            // println!("✅ Found {} Vortex metrics sets with total {} metrics",
+            //     vortex_metrics_sets.len(),
+            //     vortex_metrics_sets.iter().map(|set| set.iter().count()).sum::<usize>());
+
+            // Debug: Print all metric names
+            // for (i, metrics_set) in vortex_metrics_sets.iter().enumerate() {
+            //     println!("  Metrics set {} contains:", i);
+            //     for metric in metrics_set.iter() {
+            //         println!("    - {}: {:?}", metric.value().name(), metric.value());
+            //     }
+            // }
+        }
+
+        for (i, metrics_set) in vortex_metrics_sets.iter().enumerate() {
+            Self::extract_all_metrics(&metrics_set, &mut node_metrics);
         }
         
         // Build children recursively
@@ -215,19 +396,42 @@ impl QueryProfile {
             .map(|child| Self::build_node(child, depth + 1))
             .collect();
         
-        // Calculate filter statistics for FilterExec
+        // Calculate rows statistics for various operators
         // Input rows = find the first valid output_rows in the subtree
         // (RepartitionExec and some other operators don't expose output_rows)
+
+        // For FilterExec - standard filter statistics
         if operator_name.contains("Filter") && !children.is_empty() {
             let input_rows = Self::find_input_rows_in_subtree(&children);
-            
+
             if input_rows > 0 {
                 node_metrics.input_rows = Some(input_rows);
-                
+
                 if let Some(output) = node_metrics.output_rows {
                     node_metrics.rows_filtered = Some(input_rows.saturating_sub(output));
                     node_metrics.selectivity = Some(output as f64 / input_rows as f64);
                 }
+            }
+        }
+
+        // For DataSource/Scan operations - show scan output even without explicit filter
+        else if operator_name.contains("DataSource") || operator_name.contains("Scan") {
+            // For scan operations, we can show output_rows as a basic metric
+            // This helps identify if data is being read but not filtered
+            if let Some(output) = node_metrics.output_rows {
+                tracing::debug!("Scan operation produced {} output rows", output);
+            }
+        }
+
+        // For Join operations - show join statistics
+        else if operator_name.contains("Join") && !children.is_empty() {
+            // Try to get input rows from children for join statistics
+            let left_rows = children.get(0).and_then(|c| c.metrics.output_rows).unwrap_or(0);
+            let right_rows = children.get(1).and_then(|c| c.metrics.output_rows).unwrap_or(0);
+
+            if left_rows > 0 || right_rows > 0 {
+                tracing::debug!("Join operation: left={} rows, right={} rows, output={:?}",
+                    left_rows, right_rows, node_metrics.output_rows);
             }
         }
         
@@ -248,7 +452,7 @@ impl QueryProfile {
         let mut scan_total_nanos: u64 = 0;
         
         for metric in metrics.iter() {
-            let name = metric.value().name();
+            let _name = metric.value().name();
             match metric.value() {
                 MetricValue::Count { name, count } => {
                     let value = count.value();
@@ -278,6 +482,55 @@ impl QueryProfile {
                             let current = node_metrics.page_index_rows_pruned.unwrap_or(0);
                             node_metrics.page_index_rows_pruned = Some(current + value);
                         }
+                        // Vortex Logical Pruning Metrics
+                        "logical_windows_total" => {
+                            let current = node_metrics.logical_windows_total.unwrap_or(0);
+                            node_metrics.logical_windows_total = Some(current + value);
+                        }
+                        "logical_windows_pruned_statistics" => {
+                            let current = node_metrics.logical_windows_pruned_statistics.unwrap_or(0);
+                            node_metrics.logical_windows_pruned_statistics = Some(current + value);
+                            // Also map to DataFusion's row_groups_pruned_statistics
+                            let current_df = node_metrics.row_groups_pruned_statistics.unwrap_or(0);
+                            node_metrics.row_groups_pruned_statistics = Some(current_df + value);
+                        }
+                        "logical_windows_selected" => {
+                            let current = node_metrics.logical_windows_selected.unwrap_or(0);
+                            node_metrics.logical_windows_selected = Some(current + value);
+                        }
+                        "rows_pruned_by_statistics" => {
+                            let current: usize = node_metrics.rows_pruned_by_statistics.unwrap_or(0);
+                            node_metrics.rows_pruned_by_statistics = Some(current + value);
+                            // Also map to DataFusion's pushdown_rows_pruned
+                            let current_df = node_metrics.pushdown_rows_pruned.unwrap_or(0);
+                            node_metrics.pushdown_rows_pruned = Some(current_df + value);
+                        }
+                        // Vortex Segment / IO Metrics
+                        "segments_touched" => {
+                            let current = node_metrics.segments_touched.unwrap_or(0);
+                            node_metrics.segments_touched = Some(current + value);
+                        }
+                        "segment_slices_read" => {
+                            let current = node_metrics.segment_slices_read.unwrap_or(0);
+                            node_metrics.segment_slices_read = Some(current + value);
+                        }
+                        "bytes_read_from_segments" => {
+                            let current = node_metrics.bytes_read_from_segments.unwrap_or(0);
+                            node_metrics.bytes_read_from_segments = Some(current + value);
+                        }
+                        "bytes_skipped_by_zonemap" => {
+                            let current = node_metrics.bytes_skipped_by_zonemap.unwrap_or(0);
+                            node_metrics.bytes_skipped_by_zonemap = Some(current + value);
+                        }
+                        // Vortex Decode / Materialization Metrics
+                        "rows_decoded" => {
+                            let current = node_metrics.rows_decoded.unwrap_or(0);
+                            node_metrics.rows_decoded = Some(current + value);
+                        }
+                        "record_batches_emitted" => {
+                            let current = node_metrics.record_batches_emitted.unwrap_or(0);
+                            node_metrics.record_batches_emitted = Some(current + value);
+                        }
                         _ => {
                             // Skip other count metrics to reduce noise
                         }
@@ -296,6 +549,19 @@ impl QueryProfile {
                         "time_elapsed_scanning_total" => {
                             // Accumulate scan time from all partitions (use max instead of sum for parallel)
                             scan_total_nanos = scan_total_nanos.max(nanos as u64);
+                        }
+                        // Vortex Time Metrics
+                        "time_pruning_ns" => {
+                            let current = node_metrics.time_pruning_ns.unwrap_or(Duration::ZERO);
+                            node_metrics.time_pruning_ns = Some(current + duration);
+                        }
+                        "time_io_ns" => {
+                            let current = node_metrics.time_io_ns.unwrap_or(Duration::ZERO);
+                            node_metrics.time_io_ns = Some(current + duration);
+                        }
+                        "time_decode_ns" => {
+                            let current = node_metrics.time_decode_ns.unwrap_or(Duration::ZERO);
+                            node_metrics.time_decode_ns = Some(current + duration);
                         }
                         _ => {
                             // Skip other time metrics to reduce noise
@@ -388,11 +654,11 @@ impl QueryProfile {
     }
     
     /// Print detailed profile report
-    pub fn print(&self) {
+    pub fn print(&self, metrics_config: &VortexMetricsConfig) {
         println!("Origin SQL:\n {}", self.origin_sql);
         self.print_phases();
         self.print_raw_physical_plan();
-        self.print_plan_tree();
+        self.print_plan_tree(metrics_config);
         self.print_summary();
     }
     
@@ -434,11 +700,11 @@ impl QueryProfile {
         );
     }
     
-    fn print_plan_tree(&self) {
+    fn print_plan_tree(&self, metrics_config: &VortexMetricsConfig) {
         println!("\n{}", "=".repeat(80));
         println!("Execution Plan Tree");
         println!("{}", "=".repeat(80));
-        self.plan_tree.print_tree();
+        self.plan_tree.print_tree(metrics_config);
     }
     
     fn print_summary(&self) {
@@ -502,11 +768,11 @@ impl PlanNode {
         }
     }
     
-    fn print_tree(&self) {
-        self.print_node("", true);
+    fn print_tree(&self, metrics_config: &VortexMetricsConfig) {
+        self.print_node("", true, metrics_config);
     }
     
-    fn print_node(&self, prefix: &str, is_last: bool) {
+    fn print_node(&self, prefix: &str, is_last: bool, metrics_config: &VortexMetricsConfig) {
         let connector = if is_last { "└── " } else { "├── " };
         let next_prefix = if is_last { "    " } else { "│   " };
         
@@ -558,6 +824,89 @@ impl PlanNode {
                 if rg_pruned > 0 {
                     let rg_matched = self.metrics.row_groups_matched_statistics.unwrap_or(0);
                     metrics_parts.push(format!("rg_pruned:{}/{}", rg_pruned, rg_pruned + rg_matched));
+                }
+            }
+            
+            // Vortex Logical Pruning Metrics
+            if let Some(windows_total) = self.metrics.logical_windows_total {
+                if let Some(windows_pruned) = self.metrics.logical_windows_pruned_statistics {
+                    if windows_pruned > 0 {
+                        let windows_selected = self.metrics.logical_windows_selected.unwrap_or(0);
+                        let prune_pct = if windows_total > 0 {
+                            (windows_pruned as f64 / windows_total as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        metrics_parts.push(format!(
+                            "logical_windows:{}/{} pruned ({}%), selected:{}",
+                            windows_pruned, windows_total, prune_pct as u32, windows_selected
+                        ));
+                    }
+                }
+            }
+            
+            if let Some(rows_pruned) = self.metrics.rows_pruned_by_statistics {
+                if rows_pruned > 0 {
+                    metrics_parts.push(format!("rows_pruned_by_zonemap:{}", rows_pruned));
+                }
+            }
+            
+            // Vortex Segment / IO Metrics
+            if let Some(segments) = self.metrics.segments_touched {
+                if segments > 0 {
+                    metrics_parts.push(format!("segments_touched:{}", segments));
+                }
+            }
+            
+            if let Some(slices) = self.metrics.segment_slices_read {
+                if slices > 0 {
+                    metrics_parts.push(format!("segment_slices_read:{}", slices));
+                }
+            }
+            
+            if let Some(bytes) = self.metrics.bytes_read_from_segments {
+                if bytes > 0 {
+                    metrics_parts.push(format!("bytes_read_from_segments:{}", Self::format_bytes(bytes)));
+                }
+            }
+            
+            if let Some(bytes_skipped) = self.metrics.bytes_skipped_by_zonemap {
+                if bytes_skipped > 0 {
+                    metrics_parts.push(format!("bytes_skipped_by_zonemap:{}", Self::format_bytes(bytes_skipped)));
+                }
+            }
+            
+            // Vortex Decode Metrics - configurable isolation mode
+            if let Some(rows_decoded) = self.metrics.rows_decoded {
+                if rows_decoded > 0 {
+                    let suffix = metrics_config.metrics_name_suffix();
+                    let help_text = metrics_config.metrics_help_text();
+                    metrics_parts.push(format!("rows_decoded{}:{}{}", suffix, rows_decoded, help_text));
+                }
+            }
+            
+            if let Some(batches) = self.metrics.record_batches_emitted {
+                if batches > 0 {
+                    metrics_parts.push(format!("record_batches_emitted:{}", batches));
+                }
+            }
+            
+            // Vortex Time Metrics
+            if let Some(time) = self.metrics.time_pruning_ns {
+                if time.as_nanos() > 0 {
+                    metrics_parts.push(format!("time_pruning:{:.2}ms", time.as_secs_f64() * 1000.0));
+                }
+            }
+            
+            if let Some(time) = self.metrics.time_io_ns {
+                if time.as_nanos() > 0 {
+                    metrics_parts.push(format!("time_io:{:.2}ms", time.as_secs_f64() * 1000.0));
+                }
+            }
+            
+            if let Some(time) = self.metrics.time_decode_ns {
+                if time.as_nanos() > 0 {
+                    metrics_parts.push(format!("time_decode:{:.2}ms", time.as_secs_f64() * 1000.0));
                 }
             }
         }
@@ -582,7 +931,7 @@ impl PlanNode {
         // Print children
         for (i, child) in self.children.iter().enumerate() {
             let is_last_child = i == self.children.len() - 1;
-            child.print_node(&format!("{}{}", prefix, next_prefix), is_last_child);
+            child.print_node(&format!("{}{}", prefix, next_prefix), is_last_child, metrics_config);
         }
     }
     
@@ -599,7 +948,7 @@ impl PlanNode {
         }
     }
     
-    fn write_tree<W: std::io::Write>(&self, writer: &mut W, prefix: &str, is_last: bool) -> std::io::Result<()> {
+    fn write_tree<W: std::io::Write>(&self, writer: &mut W, prefix: &str, is_last: bool, metrics_config: &VortexMetricsConfig) -> std::io::Result<()> {
         let connector = if is_last { "└── " } else { "├── " };
         let next_prefix = if is_last { "    " } else { "│   " };
         
@@ -653,6 +1002,89 @@ impl PlanNode {
                     metrics_parts.push(format!("rg_pruned:{}/{}", rg_pruned, rg_pruned + rg_matched));
                 }
             }
+            
+            // Vortex Logical Pruning Metrics
+            if let Some(windows_total) = self.metrics.logical_windows_total {
+                if let Some(windows_pruned) = self.metrics.logical_windows_pruned_statistics {
+                    if windows_pruned > 0 {
+                        let windows_selected = self.metrics.logical_windows_selected.unwrap_or(0);
+                        let prune_pct = if windows_total > 0 {
+                            (windows_pruned as f64 / windows_total as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        metrics_parts.push(format!(
+                            "logical_windows:{}/{} pruned ({}%), selected:{}",
+                            windows_pruned, windows_total, prune_pct as u32, windows_selected
+                        ));
+                    }
+                }
+            }
+            
+            if let Some(rows_pruned) = self.metrics.rows_pruned_by_statistics {
+                if rows_pruned > 0 {
+                    metrics_parts.push(format!("rows_pruned_by_zonemap:{}", rows_pruned));
+                }
+            }
+            
+            // Vortex Segment / IO Metrics
+            if let Some(segments) = self.metrics.segments_touched {
+                if segments > 0 {
+                    metrics_parts.push(format!("segments_touched:{}", segments));
+                }
+            }
+            
+            if let Some(slices) = self.metrics.segment_slices_read {
+                if slices > 0 {
+                    metrics_parts.push(format!("segment_slices_read:{}", slices));
+                }
+            }
+            
+            if let Some(bytes) = self.metrics.bytes_read_from_segments {
+                if bytes > 0 {
+                    metrics_parts.push(format!("bytes_read_from_segments:{}", Self::format_bytes(bytes)));
+                }
+            }
+            
+            if let Some(bytes_skipped) = self.metrics.bytes_skipped_by_zonemap {
+                if bytes_skipped > 0 {
+                    metrics_parts.push(format!("bytes_skipped_by_zonemap:{}", Self::format_bytes(bytes_skipped)));
+                }
+            }
+            
+            // Vortex Decode Metrics - configurable isolation mode
+            if let Some(rows_decoded) = self.metrics.rows_decoded {
+                if rows_decoded > 0 {
+                    let suffix = metrics_config.metrics_name_suffix();
+                    let help_text = metrics_config.metrics_help_text();
+                    metrics_parts.push(format!("rows_decoded{}:{}{}", suffix, rows_decoded, help_text));
+                }
+            }
+            
+            if let Some(batches) = self.metrics.record_batches_emitted {
+                if batches > 0 {
+                    metrics_parts.push(format!("record_batches_emitted:{}", batches));
+                }
+            }
+            
+            // Vortex Time Metrics
+            if let Some(time) = self.metrics.time_pruning_ns {
+                if time.as_nanos() > 0 {
+                    metrics_parts.push(format!("time_pruning:{:.2}ms", time.as_secs_f64() * 1000.0));
+                }
+            }
+            
+            if let Some(time) = self.metrics.time_io_ns {
+                if time.as_nanos() > 0 {
+                    metrics_parts.push(format!("time_io:{:.2}ms", time.as_secs_f64() * 1000.0));
+                }
+            }
+            
+            if let Some(time) = self.metrics.time_decode_ns {
+                if time.as_nanos() > 0 {
+                    metrics_parts.push(format!("time_decode:{:.2}ms", time.as_secs_f64() * 1000.0));
+                }
+            }
         }
         
         if let Some(bytes) = self.metrics.spilled_bytes {
@@ -675,7 +1107,7 @@ impl PlanNode {
         // Write children
         for (i, child) in self.children.iter().enumerate() {
             let is_last_child = i == self.children.len() - 1;
-            child.write_tree(writer, &format!("{}{}", prefix, next_prefix), is_last_child)?;
+            child.write_tree(writer, &format!("{}{}", prefix, next_prefix), is_last_child, metrics_config)?;
         }
         
         Ok(())
@@ -828,7 +1260,7 @@ pub fn compare_profiles(profile1: &QueryProfile, name1: &str, profile2: &QueryPr
 }
 
 /// Export profile to a text file
-pub fn export_profile_to_file(profile: &QueryProfile, file_path: &str) -> std::io::Result<()> {
+pub fn export_profile_to_file(profile: &QueryProfile, file_path: &str, metrics_config: &VortexMetricsConfig) -> std::io::Result<()> {
     use std::io::Write;
     
     let mut file = std::fs::File::create(file_path)?;
@@ -867,7 +1299,7 @@ pub fn export_profile_to_file(profile: &QueryProfile, file_path: &str) -> std::i
     writeln!(file, "\n{}", "=".repeat(80))?;
     writeln!(file, "Execution Plan Tree")?;
     writeln!(file, "{}", "=".repeat(80))?;
-    profile.plan_tree.write_tree(&mut file, "", true)?;
+    profile.plan_tree.write_tree(&mut file, "", true, metrics_config)?;
     
     // Write summary
     writeln!(file, "\n{}", "=".repeat(80))?;
